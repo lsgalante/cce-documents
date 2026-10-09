@@ -1,17 +1,18 @@
-//! Document model + background page rasterization for cce-documents.
+//! The open document, the backend that reads it, and the GPU page cache.
 //!
-//! A document is a list of pages with known sizes: PDFs report points via
-//! `pdfinfo` and rasterize per page through `pdftoppm` (poppler). Workers
-//! rasterize off-thread, upload RGBA via `cce_ui::vk::upload_rgba` (the
-//! upload queue is thread-safe), then notify the app over the calloop
-//! channel so the engine wakes and repaints.
+//! Two backends answer the same questions — page sizes, and a page
+//! rasterized at a DPI. **PDFium** (`engine`) runs in-process on one thread
+//! that owns the document, and also reads text and searches. **poppler**
+//! (`poppler`) is the fallback when PDFium cannot be loaded: it spawns
+//! `pdfinfo` / `pdftoppm` per request and can only show pages. Either way a
+//! rendered page is uploaded via `cce_ui::vk::upload_rgba` (the upload queue
+//! is thread-safe) and announced over the calloop channel so the engine
+//! wakes and repaints.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{mpsc, Arc, Mutex};
 
-use crate::Message;
+use crate::{engine, poppler, Message};
 
 /// GPU pages kept resident. The cce-ui image registry hard-caps at 256
 /// images total, so leave generous headroom.
@@ -19,81 +20,21 @@ const MAX_GPU_PAGES: usize = 24;
 /// Largest bitmap edge we'll upload; bigger pages are rendered at a capped
 /// DPI.
 const MAX_DIM: u32 = 8192;
-const RENDER_THREADS: usize = 2;
 
-/// Page size in document units (points).
-#[derive(Debug, Clone, Copy)]
+/// Page size in display points: the page as shown before the user rotates
+/// it, with its own /Rotate applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageSize {
     pub w: f64,
     pub h: f64,
 }
 
 pub struct Document {
+    /// Distinguishes this opening from every other, so late answers about
+    /// a previous document are recognised and dropped.
+    pub id: u64,
     pub path: PathBuf,
     pub pages: Vec<PageSize>,
-}
-
-impl Document {
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
-        match ext.as_deref() {
-            Some("pdf") => Self::load_pdf(path),
-            _ => Err("unsupported file type".to_string()),
-        }
-    }
-
-    /// Page count from `pdfinfo`, then per-page sizes from a second ranged
-    /// call. `pdfinfo` reports MediaBox dimensions with a separate `rot`
-    /// field, while `pdftoppm` bakes /Rotate into its output — so swap
-    /// width/height here for 90°/270° pages to keep layout and pixels agreed.
-    fn load_pdf(path: &Path) -> Result<Self, String> {
-        let count_out = pdfinfo(path, &[])?;
-        let count: usize = count_out
-            .lines()
-            .find_map(|l| l.strip_prefix("Pages:"))
-            .and_then(|v| v.trim().parse().ok())
-            .ok_or("pdfinfo: no page count")?;
-        if count == 0 {
-            return Err("empty PDF".to_string());
-        }
-        let sizes_out = pdfinfo(path, &["-f", "1", "-l", &count.to_string()])?;
-        let mut sizes: Vec<PageSize> = Vec::with_capacity(count);
-        let mut rots: Vec<i32> = Vec::with_capacity(count);
-        for line in sizes_out.lines() {
-            let Some(rest) = line.strip_prefix("Page ") else { continue };
-            let Some((_, field)) = rest.trim_start().split_once(' ') else { continue };
-            if let Some(v) = field.trim_start().strip_prefix("size:") {
-                // "595.276 x 841.89 pts (A4)"
-                let mut it = v.trim().split_whitespace();
-                let w: f64 = it.next().and_then(|s| s.parse().ok()).ok_or("pdfinfo: bad size")?;
-                let h: f64 = it.nth(1).and_then(|s| s.parse().ok()).ok_or("pdfinfo: bad size")?;
-                sizes.push(PageSize { w, h });
-            } else if let Some(v) = field.trim_start().strip_prefix("rot:") {
-                rots.push(v.trim().parse().unwrap_or(0));
-            }
-        }
-        if sizes.len() != count {
-            return Err(format!("pdfinfo: {} sizes for {count} pages", sizes.len()));
-        }
-        for (s, rot) in sizes.iter_mut().zip(rots) {
-            if rot == 90 || rot == 270 {
-                std::mem::swap(&mut s.w, &mut s.h);
-            }
-        }
-        Ok(Self { path: path.to_path_buf(), pages: sizes })
-    }
-}
-
-fn pdfinfo(path: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("pdfinfo")
-        .args(args)
-        .arg(path)
-        .output()
-        .map_err(|e| format!("pdfinfo: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("pdfinfo: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// A rendered page as delivered by a worker.
@@ -103,14 +44,84 @@ pub struct Rendered {
     pub dpi: u32,
 }
 
-struct Job {
-    generation: u64,
-    page: usize,
-    dpi: u32,
-    path: PathBuf,
-    size: PageSize,
+pub struct Job {
+    pub generation: u64,
+    pub doc: u64,
+    pub page: usize,
+    pub dpi: u32,
+    pub path: PathBuf,
+    pub size: PageSize,
     /// Extra user rotation in quarter turns cw, applied to the pixels.
-    quarter_turns: u8,
+    pub quarter_turns: u8,
+}
+
+impl Job {
+    /// The DPI capped so the bitmap's longer edge stays under MAX_DIM
+    /// (page size is in points, 72/inch).
+    pub fn capped_dpi(&self) -> u32 {
+        let max_pts = self.size.w.max(self.size.h).max(1.0);
+        (self.dpi as f64).min(MAX_DIM as f64 * 72.0 / max_pts).max(18.0) as u32
+    }
+
+    /// Rotate the page's pixels by the user's quarter turns and upload them.
+    pub fn finish(&self, mut rgba: image::RgbaImage) -> Rendered {
+        match self.quarter_turns % 4 {
+            1 => rgba = image::imageops::rotate90(&rgba),
+            2 => rgba = image::imageops::rotate180(&rgba),
+            3 => rgba = image::imageops::rotate270(&rgba),
+            _ => {}
+        }
+        let (w, h) = rgba.dimensions();
+        let image = cce_ui::vk::upload_rgba(rgba.into_raw(), w, h);
+        Rendered { image, dpi: self.dpi }
+    }
+}
+
+pub enum Backend {
+    Pdfium(engine::Engine),
+    Poppler(poppler::Renderer),
+}
+
+impl Backend {
+    /// PDFium when the library loads, poppler otherwise.
+    pub fn start(notify: calloop::channel::Sender<Message>) -> Self {
+        match engine::Engine::start(notify.clone()) {
+            Ok(e) => Backend::Pdfium(e),
+            Err(e) => {
+                log::warn!("PDFium unavailable ({e}); viewing through poppler, without text or search");
+                Backend::Poppler(poppler::Renderer::new(notify))
+            }
+        }
+    }
+
+    pub fn open(&self, path: &Path, id: u64) -> Result<Document, String> {
+        let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+        if ext.as_deref() != Some("pdf") {
+            return Err("unsupported file type".to_string());
+        }
+        let pages = match self {
+            Backend::Pdfium(e) => e.open(path, id)?,
+            Backend::Poppler(_) => poppler::page_sizes(path)?,
+        };
+        if pages.is_empty() {
+            return Err("empty PDF".to_string());
+        }
+        Ok(Document { id, path: path.to_path_buf(), pages })
+    }
+
+    pub fn engine(&self) -> Option<&engine::Engine> {
+        match self {
+            Backend::Pdfium(e) => Some(e),
+            Backend::Poppler(_) => None,
+        }
+    }
+
+    fn render(&self, job: Job) {
+        match self {
+            Backend::Pdfium(e) => e.render(job),
+            Backend::Poppler(p) => p.render(job),
+        }
+    }
 }
 
 enum PageState {
@@ -124,21 +135,13 @@ enum PageState {
 /// document/rotation are freed on arrival instead of displayed.
 pub struct PageStore {
     states: HashMap<usize, PageState>,
-    queue: mpsc::Sender<Job>,
     generation: u64,
     frame: u64,
 }
 
 impl PageStore {
-    pub fn new(notify: calloop::channel::Sender<Message>) -> Self {
-        let (queue, rx) = mpsc::channel::<Job>();
-        let rx = Arc::new(Mutex::new(rx));
-        for _ in 0..RENDER_THREADS {
-            let rx = Arc::clone(&rx);
-            let notify = notify.clone();
-            std::thread::spawn(move || worker(rx, notify));
-        }
-        Self { states: HashMap::new(), queue, generation: 0, frame: 0 }
+    pub fn new() -> Self {
+        Self { states: HashMap::new(), generation: 0, frame: 0 }
     }
 
     pub fn begin_frame(&mut self) {
@@ -157,9 +160,17 @@ impl PageStore {
     /// The page's GPU image if resident (marks it used, queues a DPI upgrade
     /// when the resident render is stale); otherwise queues a render (once)
     /// and returns None.
-    pub fn ensure(&mut self, doc: &Document, quarter_turns: u8, page: usize, want_dpi: u32) -> Option<Rendered> {
+    pub fn ensure(
+        &mut self,
+        backend: &Backend,
+        doc: &Document,
+        quarter_turns: u8,
+        page: usize,
+        want_dpi: u32,
+    ) -> Option<Rendered> {
         let job = |dpi| Job {
             generation: self.generation,
+            doc: doc.id,
             page,
             dpi,
             path: doc.path.clone(),
@@ -171,14 +182,14 @@ impl PageStore {
                 *last_used = self.frame;
                 if r.dpi != want_dpi && !*refreshing {
                     *refreshing = true;
-                    let _ = self.queue.send(job(want_dpi));
+                    backend.render(job(want_dpi));
                 }
                 Some(*r)
             }
             Some(_) => None,
             None => {
                 self.states.insert(page, PageState::Pending);
-                let _ = self.queue.send(job(want_dpi));
+                backend.render(job(want_dpi));
                 None
             }
         }
@@ -223,49 +234,4 @@ impl PageStore {
             }
         }
     }
-}
-
-fn worker(rx: Arc<Mutex<mpsc::Receiver<Job>>>, notify: calloop::channel::Sender<Message>) {
-    loop {
-        let job = match rx.lock().unwrap().recv() {
-            Ok(j) => j,
-            Err(_) => return,
-        };
-        let result = render(&job)
-            .map_err(|e| log::warn!("{}: page {}: {e}", job.path.display(), job.page + 1))
-            .ok();
-        let msg = Message::Page { generation: job.generation, page: job.page, result };
-        if notify.send(msg).is_err() {
-            return;
-        }
-    }
-}
-
-fn render(job: &Job) -> Result<Rendered, String> {
-    // Cap the DPI so the page bitmap stays under MAX_DIM on its longer
-    // edge (page size is in points, 72/inch).
-    let max_pts = job.size.w.max(job.size.h).max(1.0);
-    let dpi = (job.dpi as f64).min(MAX_DIM as f64 * 72.0 / max_pts).max(18.0) as u32;
-    let page = (job.page + 1).to_string();
-    // No output root: poppler's pdftoppm writes the PNG to stdout.
-    let out = Command::new("pdftoppm")
-        .args(["-png", "-r", &dpi.to_string(), "-f", &page, "-l", &page])
-        .arg(&job.path)
-        .output()
-        .map_err(|e| format!("pdftoppm: {e}"))?;
-    if !out.status.success() || out.stdout.is_empty() {
-        return Err(format!("pdftoppm: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    let mut rgba = image::load_from_memory_with_format(&out.stdout, image::ImageFormat::Png)
-        .map_err(|e| e.to_string())?
-        .to_rgba8();
-    match job.quarter_turns % 4 {
-        1 => rgba = image::imageops::rotate90(&rgba),
-        2 => rgba = image::imageops::rotate180(&rgba),
-        3 => rgba = image::imageops::rotate270(&rgba),
-        _ => {}
-    }
-    let (w, h) = rgba.dimensions();
-    let image = cce_ui::vk::upload_rgba(rgba.into_raw(), w, h);
-    Ok(Rendered { image, dpi: job.dpi })
 }

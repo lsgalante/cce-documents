@@ -11,3 +11,7 @@ wayland-client = { version = "0.31", features = ["system"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 log = "0.4"
 env_logger = "0.11"
+# PDFium, loaded at runtime from ~/.local/lib (scripts/fetch-pdfium). The
+# API version is pinned to the newest pdfium-render knows; the fetched build
+# may be newer, which PDFium's stable C API allows.
+pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_7881", "thread_safe"] }

@@ -1,0 +1,26 @@
+#!/bin/sh
+# Install the PDFium shared library cce-documents renders and reads PDFs with.
+#
+# PDFium is a native library outside cargo, so a build alone does not bring
+# it. This fetches a pinned build from bblanchon/pdfium-binaries (weekly
+# builds of Google's PDFium, BSD-3/Apache-2.0) into ~/.local/lib, which is
+# one of the places the app looks (see `pdfium_paths` in src/engine.rs).
+# Without it cce-documents still opens PDFs through poppler, view-only.
+#
+# Bump PDFIUM_BUILD deliberately: pdfium-render's `pdfium_*` feature in
+# Cargo.toml names the API version the code is written against.
+set -eu
+
+PDFIUM_BUILD=8086
+URL="https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/$PDFIUM_BUILD/pdfium-linux-x64.tgz"
+DEST="$HOME/.local/lib"
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+echo "==> fetching PDFium chromium/$PDFIUM_BUILD"
+curl -fsSL "$URL" -o "$tmp/pdfium.tgz"
+tar -xzf "$tmp/pdfium.tgz" -C "$tmp" lib/libpdfium.so
+mkdir -p "$DEST"
+install -m 0644 "$tmp/lib/libpdfium.so" "$DEST/libpdfium.so.new"
+mv "$DEST/libpdfium.so.new" "$DEST/libpdfium.so"
+echo "==> installed $DEST/libpdfium.so"
