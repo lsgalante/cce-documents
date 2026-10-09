@@ -126,7 +126,9 @@ impl Backend {
 
 enum PageState {
     Pending,
-    Ready { r: Rendered, refreshing: bool, last_used: u64 },
+    /// `stale`: the document changed under this render; it stays on screen
+    /// until the new one lands.
+    Ready { r: Rendered, refreshing: bool, stale: bool, last_used: u64 },
     Failed,
 }
 
@@ -178,9 +180,10 @@ impl PageStore {
             quarter_turns,
         };
         match self.states.get_mut(&page) {
-            Some(PageState::Ready { r, refreshing, last_used }) => {
+            Some(PageState::Ready { r, refreshing, stale, last_used }) => {
                 *last_used = self.frame;
-                if r.dpi != want_dpi && !*refreshing {
+                if (r.dpi != want_dpi || *stale) && !*refreshing {
+                    *stale = false;
                     *refreshing = true;
                     backend.render(job(want_dpi));
                 }
@@ -203,13 +206,31 @@ impl PageStore {
             return;
         }
         let state = match result {
-            Some(r) => PageState::Ready { r, refreshing: false, last_used: self.frame },
+            Some(r) => PageState::Ready { r, refreshing: false, stale: false, last_used: self.frame },
             None => PageState::Failed,
         };
         if let Some(PageState::Ready { r, .. }) = self.states.insert(page, state) {
             cce_ui::vk::free_image(r.image);
         }
         self.evict();
+    }
+
+    /// The page changed (an edit): render it again, showing the old image
+    /// meanwhile. A render already in flight shows the page from before the
+    /// edit, so a fresh one is asked for regardless.
+    pub fn invalidate(&mut self, page: usize) {
+        match self.states.get_mut(&page) {
+            Some(PageState::Ready { refreshing, stale, .. }) => {
+                *refreshing = false;
+                *stale = true;
+            }
+            // A first render still pending may predate the edit too: ask
+            // again (the later answer lands last and wins).
+            Some(PageState::Failed) | Some(PageState::Pending) => {
+                self.states.remove(&page);
+            }
+            None => {}
+        }
     }
 
     /// Free the least-recently-used pages once over budget; pages touched

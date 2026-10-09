@@ -11,16 +11,28 @@
 //! the whole document, Ctrl+F searches. Without PDFium the poppler fallback
 //! only shows pages (`doc::Backend`).
 //!
+//! With PDFium the page can be marked up and filled in, and saved as the
+//! original bytes plus an incremental update (`engine`): select text and
+//! press h / u / s to highlight, underline or strike it; d draws in ink, n
+//! places a note, v is back to selecting; click a form field to fill it, a
+//! note to edit it, any other mark to pick it (Delete removes it); Ctrl+Z
+//! takes back the last mark; Ctrl+S saves, Ctrl+Shift+S saves as. The
+//! toolbar along the bottom does the same.
+//!
 //! Keys: o open · +/- zoom · 0 fit · 1 actual size · r/l rotate ·
 //! arrows/PageUp/PageDown/Home/End pages · Ctrl+F find · Enter/F3 next match
-//! (Shift: previous) · Esc close find or clear the selection · q quit.
+//! (Shift: previous) · Esc close an editor, find, the pick, the selection or
+//! the tool, in that order · q quit (twice with unsaved changes).
 //! Wheel scrolls, ctrl+wheel and pinch zoom at the pointer, drag pans (or
 //! selects, when the press lands on text).
 
+mod chrome;
 mod doc;
 mod engine;
+mod markup;
 mod poppler;
 mod text;
+mod trim;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -33,7 +45,9 @@ use cce_ui::widget::line_edit::EditOutcome;
 use cce_ui::widget::scroll_motion::{Bounds, ScrollMotion};
 use cce_ui::widget::{ElementState, Key, KeyEvent, LineEdit, MouseButton, MouseScrollDelta, NamedKey, Position};
 
+use chrome::{Action, Button, FieldLook};
 use doc::{Backend, Document, PageStore, Rendered};
+use markup::{annot_at, Annot, AnnotKind, Edit, FieldKind, MarkupKind};
 use text::{Mark, PageText, PtRect, Selection};
 
 /// Vertical gap between pages, in document units (so the layout scales
@@ -59,6 +73,13 @@ const FIND_FONT: f32 = 13.0;
 const SELECTION: [f32; 4] = [0.25, 0.5, 1.0, 0.35];
 const MATCH: [f32; 4] = [1.0, 0.85, 0.0, 0.40];
 const MATCH_CURRENT: [f32; 4] = [1.0, 0.5, 0.0, 0.60];
+const PICKED: [f32; 4] = [0.25, 0.5, 1.0, 0.9];
+/// Ink while it is being drawn; the engine's ink color, as RGBA.
+const INK: [f32; 4] = [200.0 / 255.0, 30.0 / 255.0, 60.0 / 255.0, 1.0];
+/// A pen stroke's width, in points.
+const INK_PT: f64 = 2.0;
+const NOTE_EDITOR_W: f32 = 280.0;
+const NOTE_EDITOR_H: f32 = 30.0;
 
 #[derive(Debug, Clone)]
 enum Message {
@@ -66,7 +87,37 @@ enum Message {
     Text { doc: u64, page: usize, text: Arc<PageText> },
     Hits { generation: u64, page: usize, hits: Vec<Vec<PtRect>> },
     SearchDone { generation: u64 },
+    Annots { doc: u64, page: usize, annots: Arc<Vec<markup::Annot>> },
+    Edited { doc: u64, page: usize, ok: bool },
     Quit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tool {
+    Select,
+    Draw,
+    Note,
+}
+
+/// What an open editor writes to when committed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EditTarget {
+    Field { index: usize },
+    /// A note: an existing one by index, or a new one at a point.
+    Note { index: Option<usize>, at: (f64, f64) },
+}
+
+/// A one-line editor over the page: a text field being filled, or a note
+/// being written.
+struct Editor {
+    page: usize,
+    target: EditTarget,
+    edit: LineEdit,
+    /// The text it opened with: committing it unchanged changes nothing.
+    original: String,
+    /// Where it sits, in display points on `page`: the field's box, or the
+    /// note's anchor.
+    anchor: PtRect,
 }
 
 /// The find bar and what its query has found so far.
@@ -96,8 +147,25 @@ struct DocumentsApp {
     find: Option<Find>,
     /// Bumped per query, so hits for an older one are dropped on arrival.
     search_generation: u64,
-    /// For measuring the find field's caret; made when find first opens.
+    /// For measuring the toolbar and text fields; made on first use.
     font_system: Option<cce_ui::cosmic_text::FontSystem>,
+    tool: Tool,
+    /// Page annotations by page, as the engine delivers them, and the
+    /// pages asked for.
+    annots: HashMap<usize, Arc<Vec<Annot>>>,
+    annots_asked: HashSet<usize>,
+    /// A picked annotation: page and index. Delete removes it.
+    picked: Option<(usize, usize)>,
+    /// Ink being drawn: its page and points so far, in display points.
+    stroke: Option<(usize, Vec<(f64, f64)>)>,
+    editor: Option<Editor>,
+    /// Changes the file does not have yet.
+    dirty: bool,
+    /// A line under the HUD (saved, a failure, the quit warning) until the
+    /// next key or press.
+    status: Option<String>,
+    /// `q` with unsaved changes warns once; a second `q` quits.
+    quit_armed: bool,
     /// User rotation in quarter turns clockwise, whole-document.
     quarter_turns: u8,
     /// Screen px per document unit (pt).
@@ -322,8 +390,15 @@ impl DocumentsApp {
         self.error = None;
         self.texts.clear();
         self.texts_asked.clear();
+        self.annots.clear();
+        self.annots_asked.clear();
         self.selection = None;
         self.selecting = false;
+        self.picked = None;
+        self.stroke = None;
+        self.editor = None;
+        self.dirty = false;
+        self.quit_armed = false;
         self.next_doc += 1;
         match self.backend.open(path, self.next_doc) {
             Ok(d) => {
@@ -503,6 +578,270 @@ impl DocumentsApp {
         Rect { x: self.win.0 - inset - w, y: inset, width: w, height: FIND_H }
     }
 
+    /// Ask the engine for a page's annotations, once.
+    fn want_annots(&mut self, page: usize) {
+        if let (Some(e), Some(doc)) = (self.backend.engine(), &self.doc) {
+            if !self.annots.contains_key(&page) && self.annots_asked.insert(page) {
+                e.request_annots(doc.id, page);
+            }
+        }
+    }
+
+    fn edit(&self, edit: Edit) {
+        if let (Some(e), Some(doc)) = (self.backend.engine(), &self.doc) {
+            e.edit(doc.id, edit);
+        }
+    }
+
+    /// Mark the selected text: one annotation per page it covers.
+    fn mark_selection(&mut self, kind: MarkupKind) {
+        let Some(sel) = self.selection.filter(|s| !s.is_empty()) else { return };
+        let (a, b) = sel.ordered();
+        let last = b.page.min(self.doc.as_ref().map_or(0, |d| d.pages.len()).saturating_sub(1));
+        for page in a.page..=last {
+            let Some(text) = self.text_now(page) else { continue };
+            let Some((lo, hi)) = sel.range_on(page, text.len()) else { continue };
+            let rects = text.rects(lo, hi);
+            if !rects.is_empty() {
+                self.edit(Edit::Markup { page, kind, rects });
+            }
+        }
+        self.selection = None;
+    }
+
+    fn set_tool(&mut self, tool: Tool) {
+        self.commit_editor();
+        self.tool = tool;
+        self.picked = None;
+        if tool != Tool::Select {
+            self.selection = None;
+        }
+    }
+
+    fn undo(&mut self) {
+        if let (Some(e), Some(doc)) = (self.backend.engine(), &self.doc) {
+            e.undo(doc.id);
+        }
+    }
+
+    /// Save over the file (or, choosing, to a new one): the original bytes
+    /// plus an incremental update.
+    fn save(&mut self, choose: bool) {
+        self.commit_editor();
+        let Some(doc) = &self.doc else { return };
+        let target = if choose {
+            match cce_ui::file_dialog::save_file("Save As", &[("PDF", &["pdf"])]) {
+                Some(p) if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) => p,
+                Some(p) => p.with_extension("pdf"),
+                None => return,
+            }
+        } else {
+            doc.path.clone()
+        };
+        let id = doc.id;
+        let Some(e) = self.backend.engine() else { return };
+        match e.save(id, &target) {
+            Ok(()) => {
+                self.dirty = false;
+                self.quit_armed = false;
+                let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+                self.status = Some(format!("Saved {name}"));
+                if let Some(d) = &mut self.doc {
+                    d.path = target;
+                }
+            }
+            Err(err) => self.status = Some(format!("Not saved: {err}")),
+        }
+    }
+
+    fn run_action(&mut self, action: Action) {
+        match action {
+            Action::Select => self.set_tool(Tool::Select),
+            Action::Draw => self.set_tool(Tool::Draw),
+            Action::Note => self.set_tool(Tool::Note),
+            Action::Highlight => self.mark_selection(MarkupKind::Highlight),
+            Action::Underline => self.mark_selection(MarkupKind::Underline),
+            Action::Strike => self.mark_selection(MarkupKind::StrikeOut),
+            Action::Undo => self.undo(),
+            Action::Save => self.save(false),
+        }
+    }
+
+    /// The markup toolbar's buttons and where they sit; none without PDFium
+    /// or a document.
+    fn toolbar(&mut self) -> Option<(Vec<Button>, Vec<Rect>)> {
+        if self.backend.engine().is_none() || self.doc.is_none() {
+            return None;
+        }
+        let has_sel = self.selection.is_some_and(|s| !s.is_empty());
+        let b = |label, action, on, enabled, group| Button { label, action, on, enabled, group };
+        let buttons = vec![
+            b("Select", Action::Select, self.tool == Tool::Select, true, false),
+            b("Draw", Action::Draw, self.tool == Tool::Draw, true, false),
+            b("Note", Action::Note, self.tool == Tool::Note, true, false),
+            b("Highlight", Action::Highlight, false, has_sel, true),
+            b("Underline", Action::Underline, false, has_sel, false),
+            b("Strike", Action::Strike, false, has_sel, false),
+            b("Undo", Action::Undo, false, true, true),
+            b("Save", Action::Save, self.dirty, true, false),
+        ];
+        let fs = self.font_system.get_or_insert_with(cce_ui::create_font_system);
+        let rects = chrome::toolbar_layout(fs, &buttons, self.win);
+        Some((buttons, rects))
+    }
+
+    fn open_editor(&mut self, page: usize, target: EditTarget, text: String, anchor: PtRect) {
+        self.commit_editor();
+        if self.font_system.is_none() {
+            self.font_system = Some(cce_ui::create_font_system());
+        }
+        if let Some(f) = &mut self.find {
+            f.focused = false;
+        }
+        let mut edit = LineEdit::with_text(text.clone());
+        edit.select_all();
+        self.editor = Some(Editor { page, target, edit, original: text, anchor });
+    }
+
+    /// Write an open editor's text into the document and close it.
+    fn commit_editor(&mut self) {
+        let Some(mut ed) = self.editor.take() else { return };
+        ed.edit.drop_composition();
+        let text = ed.edit.text.clone();
+        if text == ed.original {
+            return;
+        }
+        match ed.target {
+            EditTarget::Field { index } => self.edit(Edit::SetText { page: ed.page, index, value: text }),
+            EditTarget::Note { index: Some(index), .. } => self.edit(Edit::SetContents { page: ed.page, index, contents: text }),
+            EditTarget::Note { index: None, at } => {
+                if !text.trim().is_empty() {
+                    self.edit(Edit::Note { page: ed.page, at, contents: text });
+                }
+            }
+        }
+    }
+
+    fn cancel_editor(&mut self) {
+        if let Some(mut ed) = self.editor.take() {
+            ed.edit.drop_composition();
+        }
+    }
+
+    /// The open editor's box on screen, and its type size.
+    fn editor_rect(&self) -> Option<(Rect, f32)> {
+        let ed = self.editor.as_ref()?;
+        let (rects, cw, ch) = self.layout();
+        let r = self.screen_rect(&rects, self.origin(cw, ch), ed.page, &ed.anchor);
+        Some(match ed.target {
+            EditTarget::Field { .. } => {
+                let h = r.height.max(22.0);
+                (Rect { x: r.x, y: r.y + (r.height - h) / 2.0, width: r.width.max(80.0), height: h }, (h * 0.6).clamp(11.0, 16.0))
+            }
+            EditTarget::Note { .. } => {
+                let x = r.x.min(self.win.0 - NOTE_EDITOR_W - 8.0).max(8.0);
+                let mut y = r.y + r.height + 6.0;
+                if y + NOTE_EDITOR_H > self.win.1 - 8.0 {
+                    y = r.y - NOTE_EDITOR_H - 6.0;
+                }
+                (Rect { x, y, width: NOTE_EDITOR_W, height: NOTE_EDITOR_H }, 13.0)
+            }
+        })
+    }
+
+    /// A press on an annotation in the Select tool: fill a field, open a
+    /// note, or pick the mark.
+    fn press_annot(&mut self, page: usize, a: Annot) {
+        self.selection = None;
+        self.picked = None;
+        match a.kind {
+            AnnotKind::Field(FieldKind::Text { read_only: false }) => {
+                let value = match (self.backend.engine(), &self.doc) {
+                    (Some(e), Some(doc)) => e.field_value(doc.id, page, a.index).unwrap_or_default(),
+                    _ => return,
+                };
+                self.open_editor(page, EditTarget::Field { index: a.index }, value, a.rect);
+            }
+            AnnotKind::Field(FieldKind::CheckBox { read_only: false }) | AnnotKind::Field(FieldKind::Radio { read_only: false }) => {
+                self.commit_editor();
+                self.edit(Edit::Toggle { page, index: a.index });
+            }
+            AnnotKind::Field(_) => {}
+            AnnotKind::Note => {
+                let at = ((a.rect.x0 + a.rect.x1) / 2.0, (a.rect.y0 + a.rect.y1) / 2.0);
+                self.open_editor(page, EditTarget::Note { index: Some(a.index), at }, a.contents.clone(), a.rect);
+            }
+            AnnotKind::Markup(_) | AnnotKind::Ink => self.picked = Some((page, a.index)),
+            AnnotKind::Other => {}
+        }
+    }
+
+    /// A screen point in display points on a given page, clamped to it (a
+    /// stroke stays on the page it started on).
+    fn point_on_page(&self, page: usize, px: f64, py: f64) -> Option<(f64, f64)> {
+        let doc = self.doc.as_ref()?;
+        let (rects, cw, ch) = self.layout();
+        let (ox, oy) = self.origin(cw, ch);
+        let r = rects.get(page)?;
+        let size = doc.pages[page];
+        let u = ((px - ox) / self.zoom - r.x).clamp(0.0, r.w);
+        let v = ((py - oy) / self.zoom - r.y).clamp(0.0, r.h);
+        Some(unturn(self.quarter_turns, size.w, size.h, u, v))
+    }
+
+    /// Draw what sits over the pages: the picked mark, ink being drawn, a
+    /// note's text under the pointer, an open editor.
+    fn paint_overlays(&mut self, pc: &mut PaintCtx, rects: &[PageRect], origin: (f64, f64)) {
+        if let Some((page, index)) = self.picked {
+            if let Some(a) = self.annots.get(&page).and_then(|l| l.iter().find(|a| a.index == index)) {
+                let r = self.screen_rect(rects, origin, page, &a.rect);
+                let (x, y, w, h, t) = (r.x - 3.0, r.y - 3.0, r.width + 6.0, r.height + 6.0, 2.0);
+                pc.quad(Rect { x, y, width: w, height: t }, PICKED);
+                pc.quad(Rect { x, y: y + h - t, width: w, height: t }, PICKED);
+                pc.quad(Rect { x, y, width: t, height: h }, PICKED);
+                pc.quad(Rect { x: x + w - t, y, width: t, height: h }, PICKED);
+            }
+        }
+        if let Some((page, pts)) = &self.stroke {
+            let thick = (INK_PT * self.zoom).max(1.0) as f32;
+            let screen: Vec<(f32, f32)> = pts
+                .iter()
+                .map(|&(x, y)| {
+                    let r = self.screen_rect(rects, origin, *page, &PtRect { x0: x, y0: y, x1: x, y1: y });
+                    (r.x, r.y)
+                })
+                .collect();
+            for w in screen.windows(2) {
+                pc.vector(w[0].0, w[0].1, w[1].0, w[1].1, thick, INK, cce_ui::scene::paint::Cap::Round);
+            }
+        }
+        // A note's text, shown while the pointer rests on it.
+        if self.tool == Tool::Select && self.editor.is_none() && self.stroke.is_none() {
+            let hover = self.page_at(self.pointer.0, self.pointer.1, false).and_then(|(page, x, y)| {
+                let a = annot_at(self.annots.get(&page)?, x, y)?;
+                (a.kind == AnnotKind::Note && !a.contents.is_empty()).then(|| a.contents.clone())
+            });
+            if let Some(text) = hover {
+                let fs = self.font_system.get_or_insert_with(cce_ui::create_font_system);
+                let w = chrome::width_of(fs, &text, 13.0).min(420.0) + 20.0;
+                let (x, y) = ((self.pointer.0 as f32 + 14.0).min(self.win.0 - w - 8.0), self.pointer.1 as f32 + 18.0);
+                let r = Rect { x, y, width: w, height: 28.0 };
+                pc.rounded_rect(r, 6.0, (true, true, true, true), [1.0, 0.97, 0.78, 0.97]);
+                pc.clip(r, |pc| pc.text(text, x + 10.0, cce_ui::layout::align_text_y(y, 28.0, 13.0, 0.0), 13.0, [40, 36, 20]));
+            }
+        }
+        if let Some((r, size)) = self.editor_rect() {
+            let (Some(ed), Some(fs)) = (&mut self.editor, &mut self.font_system) else { return };
+            let note = matches!(ed.target, EditTarget::Note { .. });
+            let bg = if note { [1.0, 0.97, 0.78, 1.0] } else { [1.0, 1.0, 1.0, 1.0] };
+            pc.quad(Rect { x: r.x - 2.0, y: r.y - 2.0, width: r.width + 4.0, height: r.height + 4.0 }, PICKED);
+            pc.quad(r, bg);
+            let look = FieldLook { size, text: [20, 20, 20], placeholder: [140, 140, 140], caret: [0.0, 0.0, 0.0, 0.9], selection: SELECTION };
+            let field = Rect { x: r.x + 6.0, y: r.y, width: r.width - 12.0, height: r.height };
+            chrome::paint_field(pc, fs, &mut ed.edit, field, &look, if note { "Write a note, Enter to keep it" } else { "" }, true);
+        }
+    }
+
     fn paint_find(&mut self, pc: &mut PaintCtx) {
         let r = self.find_rect();
         let has_engine = self.backend.engine().is_some();
@@ -519,43 +858,16 @@ impl DocumentsApp {
             let of = if f.done { f.hits.len().to_string() } else { format!("{}+", f.hits.len()) };
             format!("{}/{of}", f.current.map_or(0, |c| c + 1))
         };
-        let count_w = if count.is_empty() { 0.0 } else { cce_ui::engine::shaped_cluster_offsets(fs, &count, FIND_FONT, None).last().map_or(0.0, |&(_, x)| x) };
+        let count_w = if count.is_empty() { 0.0 } else { chrome::width_of(fs, &count, FIND_FONT) };
         let ty = cce_ui::layout::align_text_y(r.y, r.height, FIND_FONT, 0.0);
         if !count.is_empty() {
             pc.text(count, r.x + r.width - pad - count_w, ty, FIND_FONT, [170, 170, 170]);
         }
         let field = Rect { x: r.x + pad, y: r.y, width: (r.width - 3.0 * pad - count_w).max(0.0), height: r.height };
-        if f.focused {
-            f.edit.sync_ime();
-        }
-        let shown = f.edit.display();
-        let x_of = |fs: &mut cce_ui::cosmic_text::FontSystem, byte: usize| {
-            cce_ui::engine::shaped_cluster_offsets(fs, &shown, FIND_FONT, None)
-                .iter()
-                .rev()
-                .find(|&&(b, _)| b <= byte)
-                .map_or(0.0, |&(_, x)| x)
-        };
-        let caret = x_of(fs, f.edit.display_index(f.edit.cursor));
-        let sel = f.edit.selection.filter(|&(a, b)| a < b).map(|(a, b)| (x_of(fs, f.edit.display_index(a)), x_of(fs, f.edit.display_index(b))));
-        let focused = f.focused;
+        let look = FieldLook { size: FIND_FONT, text: [235, 235, 235], placeholder: [130, 130, 130], caret: [1.0, 1.0, 1.0, 0.9], selection: SELECTION };
         let placeholder = if has_engine { "Find in document" } else { "Search needs PDFium: run scripts/fetch-pdfium" };
-        pc.clip(field, |pc| {
-            if let Some((a, b)) = sel {
-                pc.quad(Rect { x: field.x + a, y: field.y + 6.0, width: b - a, height: field.height - 12.0 }, SELECTION);
-            }
-            if shown.is_empty() {
-                pc.text(placeholder.to_string(), field.x, ty, FIND_FONT, [130, 130, 130]);
-            } else {
-                pc.text(shown.clone(), field.x, ty, FIND_FONT, [235, 235, 235]);
-            }
-            if focused {
-                pc.quad(Rect { x: field.x + caret, y: field.y + 6.0, width: 1.0, height: field.height - 12.0 }, [1.0, 1.0, 1.0, 0.9]);
-            }
-        });
-        if focused {
-            cce_ui::ime::report_caret(field.x + caret, field.y + 6.0, 1.0, field.height - 12.0);
-        }
+        let focused = f.focused;
+        chrome::paint_field(pc, fs, &mut f.edit, field, &look, placeholder, focused);
     }
 }
 
@@ -578,6 +890,15 @@ impl Application for DocumentsApp {
             find: None,
             search_generation: 0,
             font_system: None,
+            tool: Tool::Select,
+            annots: HashMap::new(),
+            annots_asked: HashSet::new(),
+            picked: None,
+            stroke: None,
+            editor: None,
+            dirty: false,
+            status: None,
+            quit_armed: false,
             quarter_turns: 0,
             zoom: 1.0,
             scroll: (0.0, 0.0),
@@ -601,6 +922,7 @@ impl Application for DocumentsApp {
         let title = match &self.doc {
             Some(d) => {
                 let name = d.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                let name = if self.dirty { format!("• {name}") } else { name.to_string() };
                 if d.pages.len() > 1 {
                     format!("{name} (page {}/{}) — Documents", self.current_page() + 1, d.pages.len())
                 } else {
@@ -640,6 +962,26 @@ impl Application for DocumentsApp {
             Message::SearchDone { generation } => {
                 if let (true, Some(f)) = (generation == self.search_generation, &mut self.find) {
                     f.done = true;
+                    *needs_rebuild = true;
+                }
+            }
+            Message::Annots { doc, page, annots } => {
+                if self.doc.as_ref().is_some_and(|d| d.id == doc) {
+                    if self.picked.is_some_and(|(p, i)| p == page && i >= annots.len()) {
+                        self.picked = None;
+                    }
+                    self.annots.insert(page, annots);
+                    *needs_rebuild = true;
+                }
+            }
+            Message::Edited { doc, page, ok } => {
+                if self.doc.as_ref().is_some_and(|d| d.id == doc) {
+                    if ok {
+                        self.store.invalidate(page);
+                        self.dirty = true;
+                    } else {
+                        self.status = Some("That change could not be made".to_string());
+                    }
                     *needs_rebuild = true;
                 }
             }
@@ -691,6 +1033,33 @@ impl Application for DocumentsApp {
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
         let (px, py) = (pos.x as f64, pos.y as f64);
+        if let Some((page, _)) = &self.stroke {
+            let page = *page;
+            if let (Some(p), Some((_, pts))) = (self.point_on_page(page, px, py), self.stroke.as_mut()) {
+                // Skip points closer than a quarter point: a slow drag
+                // would otherwise pile up hundreds.
+                if pts.last().is_none_or(|l| (l.0 - p.0).hypot(l.1 - p.1) > 0.25) {
+                    pts.push(p);
+                    *needs_rebuild = true;
+                }
+            }
+            self.pointer = (px, py);
+            return;
+        }
+        if self.editor.as_ref().is_some_and(|e| e.edit.dragging()) {
+            if let (Some((r, size)), Some(ed), Some(fs)) = (self.editor_rect(), self.editor.as_mut(), self.font_system.as_mut()) {
+                let at = chrome::offset_at(fs, &ed.edit, size, pos.x - r.x - 6.0);
+                if ed.edit.drag_to(at) {
+                    *needs_rebuild = true;
+                }
+            }
+            self.pointer = (px, py);
+            return;
+        }
+        if self.tool == Tool::Select && !self.selecting && self.drag.is_none() {
+            // The note under the pointer shows its text.
+            *needs_rebuild = true;
+        }
         if self.selecting {
             if let (Some((head, _)), Some(sel)) = (self.mark_at(px, py, true), self.selection.as_mut()) {
                 if sel.head != head {
@@ -719,21 +1088,64 @@ impl Application for DocumentsApp {
         let (px, py) = (pos.x as f64, pos.y as f64);
         match state {
             ElementState::Pressed => {
+                self.status = None;
+                self.quit_armed = false;
+                *needs_rebuild = true;
+                let inside = |r: Rect| pos.x >= r.x && pos.x <= r.x + r.width && pos.y >= r.y && pos.y <= r.y + r.height;
+                if let Some((buttons, rects)) = self.toolbar() {
+                    if rects.iter().any(|r| inside(*r)) {
+                        if let Some(action) = chrome::button_at(&buttons, &rects, pos.x, pos.y) {
+                            self.run_action(action);
+                        }
+                        return None;
+                    }
+                }
                 // The find bar takes the keyboard when clicked; the page
                 // takes it back.
-                let in_find = self.find.is_some() && {
-                    let r = self.find_rect();
-                    pos.x >= r.x && pos.x <= r.x + r.width && pos.y >= r.y && pos.y <= r.y + r.height
-                };
+                let in_find = self.find.is_some() && inside(self.find_rect());
                 if let Some(f) = &mut self.find {
                     f.focused = in_find;
-                    *needs_rebuild = true;
                 }
                 if in_find {
+                    self.commit_editor();
                     return None;
                 }
+                // An open editor: a press in it places the caret, a press
+                // anywhere else commits it (and does nothing more).
+                if let Some((r, size)) = self.editor_rect() {
+                    if inside(r) {
+                        let shift = self.shift;
+                        if let (Some(ed), Some(fs)) = (self.editor.as_mut(), self.font_system.as_mut()) {
+                            let at = chrome::offset_at(fs, &ed.edit, size, pos.x - r.x - 6.0);
+                            ed.edit.press(at, shift);
+                        }
+                    } else {
+                        self.commit_editor();
+                    }
+                    return None;
+                }
+                if let Some((page, x, y)) = self.page_at(px, py, false) {
+                    match self.tool {
+                        Tool::Draw => {
+                            self.stroke = Some((page, vec![(x, y)]));
+                            return None;
+                        }
+                        Tool::Note => {
+                            let anchor = PtRect { x0: x - 1.0, y0: y - 1.0, x1: x + 1.0, y1: y + 1.0 };
+                            self.open_editor(page, EditTarget::Note { index: None, at: (x, y) }, String::new(), anchor);
+                            return None;
+                        }
+                        Tool::Select => {
+                            if let Some(a) = self.annots.get(&page).and_then(|l| annot_at(l, x, y)).cloned() {
+                                self.press_annot(page, a);
+                                return None;
+                            }
+                        }
+                    }
+                }
+                self.picked = None;
                 match self.mark_at(px, py, false) {
-                    Some((mark, true)) => {
+                    Some((mark, true)) if self.tool == Tool::Select => {
                         self.selection = Some(match self.selection {
                             Some(s) if self.shift => Selection { anchor: s.anchor, head: mark },
                             _ => Selection { anchor: mark, head: mark },
@@ -750,6 +1162,15 @@ impl Application for DocumentsApp {
                 *needs_rebuild = true;
             }
             ElementState::Released => {
+                if let Some((page, points)) = self.stroke.take() {
+                    if points.len() >= 2 {
+                        self.edit(Edit::Ink { page, points, width: INK_PT });
+                    }
+                    *needs_rebuild = true;
+                }
+                if let Some(ed) = &mut self.editor {
+                    ed.edit.release();
+                }
                 self.drag = None;
                 self.selecting = false;
                 if self.selection.is_some_and(|s| s.is_empty()) {
@@ -813,6 +1234,33 @@ impl Application for DocumentsApp {
         }
         log::debug!("key: {:?} text={:?} ctrl={} shift={}", event.logical_key, event.text, event.ctrl, event.shift);
         let chord = |c: &str| event.ctrl && matches!(&event.logical_key, Key::Character(k) if k.eq_ignore_ascii_case(c));
+        let modifier = matches!(&event.logical_key, Key::Named(NamedKey::Control | NamedKey::Shift | NamedKey::Alt | NamedKey::Super));
+        if !modifier {
+            self.status = None;
+            *needs_rebuild = true;
+        }
+        let is_q = !event.ctrl && matches!(&event.logical_key, Key::Character(c) if c == "q");
+        if !modifier && !is_q {
+            self.quit_armed = false;
+        }
+
+        // An editor over the page has the keyboard: Enter keeps the text,
+        // Escape drops it; chords it does not own (Ctrl+S) fall through.
+        if self.editor.is_some() && !chord("s") {
+            let outcome = self.editor.as_mut().map(|e| e.edit.handle_key(event));
+            match outcome {
+                Some(EditOutcome::Edited) => return None,
+                Some(EditOutcome::Submit) => {
+                    self.commit_editor();
+                    return None;
+                }
+                Some(EditOutcome::Cancel) => {
+                    self.cancel_editor();
+                    return None;
+                }
+                _ => {}
+            }
+        }
 
         // The find field has the keyboard: it edits, Enter steps through
         // matches, Escape closes it; chords it does not own fall through.
@@ -852,6 +1300,10 @@ impl Application for DocumentsApp {
                 self.select_all();
             } else if chord("g") {
                 self.step_match(!event.shift);
+            } else if chord("s") {
+                self.save(event.shift);
+            } else if chord("z") {
+                self.undo();
             } else {
                 handled = false;
             }
@@ -875,14 +1327,34 @@ impl Application for DocumentsApp {
             Key::Character(c) if c == "r" || c == "R" => self.rotate(1),
             Key::Character(c) if c == "l" || c == "L" => self.rotate(-1),
             Key::Character(c) if c == "o" => self.open_dialog(),
-            Key::Character(c) if c == "q" => return Some(Message::Quit),
+            Key::Character(c) if c == "q" => {
+                if self.dirty && !self.quit_armed {
+                    self.quit_armed = true;
+                    self.status = Some("Unsaved changes: Ctrl+S saves them, q again quits without".to_string());
+                } else {
+                    return Some(Message::Quit);
+                }
+            }
+            Key::Character(c) if c == "h" => self.mark_selection(MarkupKind::Highlight),
+            Key::Character(c) if c == "u" => self.mark_selection(MarkupKind::Underline),
+            Key::Character(c) if c == "s" => self.mark_selection(MarkupKind::StrikeOut),
+            Key::Character(c) if c == "d" => self.set_tool(Tool::Draw),
+            Key::Character(c) if c == "n" => self.set_tool(Tool::Note),
+            Key::Character(c) if c == "v" => self.set_tool(Tool::Select),
+            Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) if self.picked.is_some() => {
+                if let Some((page, index)) = self.picked.take() {
+                    self.edit(Edit::Delete { page, index });
+                }
+            }
             Key::Character(c) if c == "/" => {
                 self.open_find();
                 self.restart_search();
             }
             Key::Named(NamedKey::F3) => self.step_match(!event.shift),
             Key::Named(NamedKey::Escape) if self.find.is_some() => self.close_find(),
-            Key::Named(NamedKey::Escape) => self.selection = None,
+            Key::Named(NamedKey::Escape) if self.picked.is_some() => self.picked = None,
+            Key::Named(NamedKey::Escape) if self.selection.is_some() => self.selection = None,
+            Key::Named(NamedKey::Escape) => self.set_tool(Tool::Select),
             Key::Named(NamedKey::ArrowUp) => self.scroll_by(0.0, -KEY_SCROLL_PX),
             Key::Named(NamedKey::ArrowDown) => self.scroll_by(0.0, KEY_SCROLL_PX),
             Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::PageUp) => {
@@ -963,6 +1435,7 @@ impl Application for DocumentsApp {
         // waiting; then the matches and the selection over the pages.
         for (i, _) in &visible {
             self.want_text(*i);
+            self.want_annots(*i);
         }
         if let Some(f) = &self.find {
             for (n, (page, hit)) in f.hits.iter().enumerate() {
@@ -984,6 +1457,8 @@ impl Application for DocumentsApp {
             }
         }
 
+        self.paint_overlays(&mut pc, &rects, (ox, oy));
+
         // HUD: file name, page, zoom (top-left chip).
         let doc = self.doc.as_ref().unwrap();
         let name = doc.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
@@ -999,6 +1474,15 @@ impl Application for DocumentsApp {
         let w = 2.0 * text_in + hud.chars().count() as f32 * 6.6;
         pc.quad(Rect { x: inset, y: inset, width: w, height: 24.0 }, [0.0, 0.0, 0.0, 0.45]);
         pc.text(hud, inset + text_in, inset + 5.0, 12.0, [230, 230, 230]);
+        if let Some(status) = self.status.clone() {
+            let fs = self.font_system.get_or_insert_with(cce_ui::create_font_system);
+            let w = 2.0 * text_in + chrome::width_of(fs, &status, 12.0);
+            pc.quad(Rect { x: inset, y: inset + 30.0, width: w, height: 24.0 }, [0.0, 0.0, 0.0, 0.6]);
+            pc.text(status, inset + text_in, inset + 35.0, 12.0, [255, 220, 150]);
+        }
+        if let Some((buttons, rects)) = self.toolbar() {
+            chrome::paint_toolbar(&mut pc, &buttons, &rects);
+        }
 
         if self.find.is_some() {
             self.paint_find(&mut pc);
