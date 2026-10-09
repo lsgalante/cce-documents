@@ -1,8 +1,7 @@
-//! Document model + background page rasterization for cce-preview.
+//! Document model + background page rasterization for cce-documents.
 //!
 //! A document is a list of pages with known sizes: PDFs report points via
-//! `pdfinfo` and rasterize per page through `pdftoppm` (poppler), raster
-//! images are single-page documents sized in pixels. Workers decode or
+//! `pdfinfo` and rasterize per page through `pdftoppm` (poppler). Workers
 //! rasterize off-thread, upload RGBA via `cce_ui::vk::upload_rgba` (the
 //! upload queue is thread-safe), then notify the app over the calloop
 //! channel so the engine wakes and repaints.
@@ -14,25 +13,15 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use crate::Message;
 
-/// Extensions the `image` crate is built to decode (keep in sync with the
-/// feature list in Cargo.toml).
-pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "ico"];
-
 /// GPU pages kept resident. The cce-ui image registry hard-caps at 256
 /// images total, so leave generous headroom.
 const MAX_GPU_PAGES: usize = 24;
-/// Largest bitmap edge we'll upload; bigger sources are downscaled (images)
-/// or rendered at a capped DPI (PDF pages).
+/// Largest bitmap edge we'll upload; bigger pages are rendered at a capped
+/// DPI.
 const MAX_DIM: u32 = 8192;
 const RENDER_THREADS: usize = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Image,
-    Pdf,
-}
-
-/// Page size in document units: points for PDFs, pixels for images.
+/// Page size in document units (points).
 #[derive(Debug, Clone, Copy)]
 pub struct PageSize {
     pub w: f64,
@@ -41,7 +30,6 @@ pub struct PageSize {
 
 pub struct Document {
     pub path: PathBuf,
-    pub kind: Kind,
     pub pages: Vec<PageSize>,
 }
 
@@ -50,18 +38,8 @@ impl Document {
         let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
         match ext.as_deref() {
             Some("pdf") => Self::load_pdf(path),
-            Some(e) if IMAGE_EXTS.contains(&e) => Self::load_image(path),
             _ => Err("unsupported file type".to_string()),
         }
-    }
-
-    fn load_image(path: &Path) -> Result<Self, String> {
-        let (w, h) = image::image_dimensions(path).map_err(|e| e.to_string())?;
-        Ok(Self {
-            path: path.to_path_buf(),
-            kind: Kind::Image,
-            pages: vec![PageSize { w: w as f64, h: h as f64 }],
-        })
     }
 
     /// Page count from `pdfinfo`, then per-page sizes from a second ranged
@@ -102,7 +80,7 @@ impl Document {
                 std::mem::swap(&mut s.w, &mut s.h);
             }
         }
-        Ok(Self { path: path.to_path_buf(), kind: Kind::Pdf, pages: sizes })
+        Ok(Self { path: path.to_path_buf(), pages: sizes })
     }
 }
 
@@ -130,7 +108,6 @@ struct Job {
     page: usize,
     dpi: u32,
     path: PathBuf,
-    kind: Kind,
     size: PageSize,
     /// Extra user rotation in quarter turns cw, applied to the pixels.
     quarter_turns: u8,
@@ -186,14 +163,13 @@ impl PageStore {
             page,
             dpi,
             path: doc.path.clone(),
-            kind: doc.kind,
             size: doc.pages[page],
             quarter_turns,
         };
         match self.states.get_mut(&page) {
             Some(PageState::Ready { r, refreshing, last_used }) => {
                 *last_used = self.frame;
-                if r.dpi != want_dpi && doc.kind == Kind::Pdf && !*refreshing {
+                if r.dpi != want_dpi && !*refreshing {
                     *refreshing = true;
                     let _ = self.queue.send(job(want_dpi));
                 }
@@ -266,36 +242,23 @@ fn worker(rx: Arc<Mutex<mpsc::Receiver<Job>>>, notify: calloop::channel::Sender<
 }
 
 fn render(job: &Job) -> Result<Rendered, String> {
-    let mut rgba = match job.kind {
-        Kind::Image => {
-            let img = image::open(&job.path).map_err(|e| e.to_string())?;
-            let mut rgba = img.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            if w.max(h) > MAX_DIM {
-                let s = MAX_DIM as f64 / w.max(h) as f64;
-                let (nw, nh) = (((w as f64 * s) as u32).max(1), ((h as f64 * s) as u32).max(1));
-                rgba = image::imageops::resize(&rgba, nw, nh, image::imageops::FilterType::Triangle);
-            }
-            rgba
-        }
-        Kind::Pdf => {
-            // Cap the DPI so the page bitmap stays under MAX_DIM on its
-            // longer edge (page size is in points, 72/inch).
-            let max_pts = job.size.w.max(job.size.h).max(1.0);
-            let dpi = (job.dpi as f64).min(MAX_DIM as f64 * 72.0 / max_pts).max(18.0) as u32;
-            let page = (job.page + 1).to_string();
-            // No output root: poppler's pdftoppm writes the PNG to stdout.
-            let out = Command::new("pdftoppm")
-                .args(["-png", "-r", &dpi.to_string(), "-f", &page, "-l", &page])
-                .arg(&job.path)
-                .output()
-                .map_err(|e| format!("pdftoppm: {e}"))?;
-            if !out.status.success() || out.stdout.is_empty() {
-                return Err(format!("pdftoppm: {}", String::from_utf8_lossy(&out.stderr).trim()));
-            }
-            image::load_from_memory(&out.stdout).map_err(|e| e.to_string())?.to_rgba8()
-        }
-    };
+    // Cap the DPI so the page bitmap stays under MAX_DIM on its longer
+    // edge (page size is in points, 72/inch).
+    let max_pts = job.size.w.max(job.size.h).max(1.0);
+    let dpi = (job.dpi as f64).min(MAX_DIM as f64 * 72.0 / max_pts).max(18.0) as u32;
+    let page = (job.page + 1).to_string();
+    // No output root: poppler's pdftoppm writes the PNG to stdout.
+    let out = Command::new("pdftoppm")
+        .args(["-png", "-r", &dpi.to_string(), "-f", &page, "-l", &page])
+        .arg(&job.path)
+        .output()
+        .map_err(|e| format!("pdftoppm: {e}"))?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return Err(format!("pdftoppm: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    let mut rgba = image::load_from_memory_with_format(&out.stdout, image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?
+        .to_rgba8();
     match job.quarter_turns % 4 {
         1 => rgba = image::imageops::rotate90(&rgba),
         2 => rgba = image::imageops::rotate180(&rgba),

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Documents
+GenericName=Document Viewer
+Comment=View PDFs
+Exec=cce-documents %f
+Icon=cce-documents
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;
+NoDisplay=false
