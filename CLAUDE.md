@@ -15,7 +15,9 @@ with undo and redo of every kind of change. Milestones 4 and 5 are here
 too: a Markdown file opens typeset onto pages and is edited right there
 (caret, selection, undo, markup hidden, formatting shortcuts, autosave, an
 outline, a word count), exports as PDF and prints through the Print
-portal.
+portal. Milestone 6 completes it: tables, footnotes, a generated table of
+contents, header and footer fields, picture size and placement, first-line
+indents, a built-in `book` style, new documents from a style, and find.
 Split from cce-preview on 2026-10-09; pictures went to cce-image.
 
 ## Shape
@@ -31,11 +33,11 @@ Split from cce-preview on 2026-10-09; pictures went to cce-image.
 | `text.rs` | Pure selection geometry: a page's chars with boxes, caret hit-testing, highlight rects, copied text |
 | `poppler.rs` | The fallback: `pdfinfo` sizes, `pdftoppm` renders, view-only |
 | `print.rs` | The Print portal (ashpd on its own thread): `PreparePrint`, then `Print` with the PDF's fd |
-| `editor.rs` | Editing a Markdown document: the text in cce-ui's `DocEditor` `Buffer`, every operation in file bytes and visible characters, autosave |
-| `writing/md.rs` | Markdown → flat blocks (pulldown-cmark), front matter, `\pagebreak` |
+| `editor.rs` | Editing a Markdown document: the text in cce-ui's `DocEditor` `Buffer`, every operation in file bytes and visible characters (tables, footnotes, pictures and inserted blocks included), autosave |
+| `writing/md.rs` | Markdown → flat blocks (pulldown-cmark): tables, footnotes and their numbers, `[TOC]`, picture attributes, front matter, `\pagebreak` |
 | `writing/style.rs` | Page, margins, faces, spacing; the built-in `manuscript` style, user KDL styles, front-matter overrides |
-| `writing/layout.rs` | Shaping (cosmic-text) into rows, then `flow` (resumable pagination: keep-with-next, no orphans or widows) |
-| `writing/edit.rs` | `Layouter` (incremental relayout: shape cache, pagination resumed at the first changed block, changed pages) and `Doc`, the geometry the caret needs |
+| `writing/layout.rs` | Shaping (cosmic-text) into rows and caret lines — paragraphs, tables, footnotes, the contents, pictures with captions; then `flow` (resumable pagination: keep-with-next, no orphans or widows, room kept for footnotes), `place_notes`, and page furniture (header and footer fields) |
+| `writing/edit.rs` | `Layouter` (incremental relayout: shape cache, pagination resumed at the first changed block, footnote placement, the contents loop, changed pages) and `Doc`: units of text and the geometry the caret, selection and find need |
 | `writing/raster.rs` | A page of the layout drawn into pixels (swash), and `Painter`, the thread that draws edited pages |
 | `writing/pdf.rs` | The pages written with krilla, glyph for glyph; outline from headings, links |
 | `writing/mod.rs` | `typeset_text` (the PDF from text, through the same `Layouter`) and the print cache path |
@@ -118,7 +120,7 @@ with an outline and a link: rotate, move, delete, insert, undo, redo,
 extract and save, with the link and outline still leading to the right
 pages afterwards and poppler reading the new order.
 
-## Writing (milestones 4 and 5)
+## Writing (milestones 4 to 6)
 
 **One layout, two outputs.** `writing::edit::Layouter` lays the Markdown
 out; the page view draws it with `raster` (swash glyphs, on the `Painter`
@@ -129,9 +131,18 @@ of the layout (measured 0.121 pt), so screen and paper agree. The screen
 snaps baselines to whole pixels and corrects glyph coverage (gamma 1/1.4);
 the PDF keeps exact positions.
 
+**Units and lines.** The caret moves through *units* of text
+(`edit::Unit`): a heading, paragraph, code block, footnote, caption, or one
+table cell. Each unit's lines (`layout::Line`: row, offset down the row,
+column bounds, clusters) say where it is drawn; caret, hit, Up/Down,
+selection and find all work on lines, never on rows. That is what lets a
+table row (one row, many cells) and a footnote (placed after the flow)
+hold the caret. Up/Down prefers the line under the goal x, so it walks a
+table's columns.
+
 **Editing is in file bytes, shown as text.** The caret is a byte of the
 `.md`; markup is hidden. `md` records anchors (text offset → file byte) on
-every span, `BlockLay::source_of`/`text_of` map both ways, and a byte in
+every span, `Unit::source_of`/`text_of` map both ways, and a byte in
 the gap between blocks (blank line, `## `, a trimmed space) belongs to the
 block after it. Stops are every character boundary (a wrapped line's space
 has no glyph but is a character). Backspace at a block's start joins it to
@@ -165,9 +176,48 @@ type in pt. Front matter may override `page`, `margins`, `font`, `size`,
 system (`create_font_system_with_system_fonts`, shared by layout and
 painter in one `Arc<Mutex<FontSystem>>`: glyph ids are per font system).
 
-Not yet: search in a writing document (find is PDFium's), first-line
-indents, tables and footnotes (milestone 6); `.md` is not claimed in the
-desktop entry.
+**Footnotes** (`[^label]` / `[^label]: text`) are numbered by first
+reference (`md` assigns numbers; the definition's place in the file does
+not matter). A reference is an *atom*: its number stands for the whole
+`[^label]`, one caret stop, deleted whole (`Unit::atoms`; deletion ranges
+are `source_of(prev)..source_of(t)`, never "start + length"). `flow`
+reserves each footnote's height at the foot of the page that first refers
+to it (`Flow::foot`, `Flow::seen` — first references come in increasing
+number order, which is why one number is enough); `place_notes` then puts
+the footnote blocks there, so the caret edits them in place. A footnote
+whose height changes repaginates from its first reference. An unreferenced
+definition is laid out nowhere (`Unit::live` false).
+
+**The contents** (`[TOC]` or `\toc` alone in a paragraph) is shaped from
+the outline of the previous layout and laid out again until its entries
+stop changing (its height can move headings). Its entries are `GoTo`
+items: PDF `/Dest` links, and a click in the app.
+
+**Tables** are GitHub's: one `Row` per table row (never split by a page),
+cells in reading order as units, an empty cell anchored between its pipes.
+Table operations rewrite the table's source lines (`editor::cells_of`
+splits a line at unescaped pipes) in one replace, so one undo takes them
+back. Typing `|` in a cell writes `\|`.
+
+**Pictures** take `{width=50% align=left}` (pandoc's attributes, `px` or
+mm units too) or `![alt|300]` (Obsidian's pixels); alt text is a caption
+and an editable unit. Backspace after a textless block (picture, rule,
+page break, contents) removes that block, not the text before it.
+
+**Styles** gained `header`/`footer` nodes (`left`/`center`/`right` with
+`{page} {pages} {title} {author} {date} {section}`, `first=#false` to skip
+page 1; `page-numbers` still works and maps to the footer), `body
+indent=` (first-line indent for a plain paragraph after another), and
+`heading … page-break=#true`. Built-ins are `writing::style::BUILT_IN`
+(`manuscript`, `book`); a user file of the same name wins. New documents
+come from `style::template` (`<name>.md` beside the style if there is
+one).
+
+Not yet: `.md` is not claimed in the desktop entry; front matter is not
+editable in the app (title/author come from it, `{title}` falls back to the
+first top-level heading); footnotes do not split across pages; a table's
+header row does not repeat on the next page; text does not wrap around
+pictures.
 
 ## Coordinates (the thing to get right)
 
@@ -193,6 +243,9 @@ qpdf exits 3 (not 0) when it repaired a file, which the tests accept.
 
 ## Verifying
 
+- To look at pages without a window: `CCE_RENDER=<file.md>
+  CCE_RENDER_OUT=<dir> cargo test -p cce-documents render_pages -- --ignored`
+  writes `page-N.png` and `out.pdf`.
 - `cargo test -p cce-documents` — the text geometry, picking, and the
   PDFium round trip above (skips parts without PDFium, qpdf, poppler or the
   CUPS sample PDF; `-- --nocapture` shows what it skipped).

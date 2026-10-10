@@ -198,6 +198,9 @@ struct DocumentsApp {
     notify: calloop::channel::Sender<Message>,
     /// The Markdown document being edited, when one is open.
     writer: Option<editor::Editor>,
+    /// How far the toolbar reaches up from the window's foot, in px (as
+    /// last drawn).
+    toolbar_room: f64,
     /// A picked picture in the writing document: its block.
     picture: Option<usize>,
     /// The new-document chooser, open: the styles to choose from.
@@ -389,11 +392,22 @@ impl DocumentsApp {
         Some((i, x, y))
     }
 
+    /// Room to scroll past the last page, so what is being written at the
+    /// foot of the last page (a footnote, the last line) can come up clear
+    /// of the toolbar.
+    fn tail_room(&self) -> f64 {
+        if self.writer.is_some() {
+            self.toolbar_room
+        } else {
+            0.0
+        }
+    }
+
     fn clamp_scroll(&mut self) {
         let (_, cw, ch) = self.layout();
         let (w, h) = (self.view_w(), self.win.1 as f64);
         self.scroll.0 = self.scroll.0.clamp(0.0, (cw * self.zoom - w).max(0.0));
-        self.scroll.1 = self.scroll.1.clamp(0.0, (ch * self.zoom - h).max(0.0));
+        self.scroll.1 = self.scroll.1.clamp(0.0, (ch * self.zoom + self.tail_room() - h).max(0.0));
     }
 
     fn scroll_by(&mut self, dx: f64, dy: f64) {
@@ -406,7 +420,7 @@ impl DocumentsApp {
     fn scroll_bounds(&self) -> (Bounds, Bounds) {
         let (_, cw, ch) = self.layout();
         let (w, h) = (self.view_w(), self.win.1 as f64);
-        (Bounds::max((cw * self.zoom - w) as f32), Bounds::max((ch * self.zoom - h) as f32))
+        (Bounds::max((cw * self.zoom - w) as f32), Bounds::max((ch * self.zoom + self.tail_room() - h) as f32))
     }
 
     /// Copy the motion's position into `scroll` exactly (the f32 round-trips
@@ -574,7 +588,7 @@ impl DocumentsApp {
         let (rects, cw, ch) = self.layout();
         let origin = self.origin(cw, ch);
         let s = self.screen_rect(&rects, origin, c.page, &PtRect { x0: c.x as f64, y0: c.y as f64, x1: c.x as f64 + 1.0, y1: (c.y + c.h) as f64 });
-        let (top, bottom) = (24.0, self.win.1 - 96.0);
+        let (top, bottom) = (24.0, self.win.1 - self.toolbar_room.max(96.0) as f32);
         if s.y < top {
             self.scroll.1 -= (top - s.y) as f64;
         } else if s.y + s.height > bottom {
@@ -1548,7 +1562,7 @@ impl DocumentsApp {
         let Some(styles) = self.chooser.clone() else { return };
         pc.quad(Rect { x: 0.0, y: 0.0, width: self.win.0, height: self.win.1 }, [0.0, 0.0, 0.0, 0.35]);
         let (panel, rows) = self.chooser_rects();
-        pc.rounded_rect(panel, 10.0, (true, true, true, true), [0.12, 0.12, 0.13, 0.98]);
+        pc.rounded_rect(panel, 10.0, (true, true, true, true), [0.02, 0.02, 0.024, 0.98]);
         pc.text("New document in the style…".to_string(), panel.x + 16.0, panel.y + 16.0, 13.0, [220, 220, 220]);
         let hover = rows.iter().position(|r| (self.pointer.0 as f32) >= r.x && (self.pointer.0 as f32) <= r.x + r.width && (self.pointer.1 as f32) >= r.y && (self.pointer.1 as f32) <= r.y + r.height);
         for (i, (name, r)) in styles.into_iter().zip(rows).enumerate() {
@@ -1854,6 +1868,7 @@ impl Application for DocumentsApp {
         let mut app = Self {
             notify: sender.clone(),
             writer: None,
+            toolbar_room: 0.0,
             picture: None,
             chooser: None,
             fonts: None,
@@ -2678,6 +2693,8 @@ impl Application for DocumentsApp {
             pc.text(status, x0 + text_in, inset + 35.0, 12.0, [255, 220, 150]);
         }
         if let Some((buttons, rects)) = self.toolbar() {
+            let top = rects.iter().map(|r| r.y).fold(size.height, f32::min);
+            self.toolbar_room = (size.height - top) as f64 + 8.0;
             chrome::paint_toolbar(&mut pc, &buttons, &rects);
         }
 
