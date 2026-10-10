@@ -1229,6 +1229,7 @@ mod tests {
         edits_survive_an_incremental_save(&lib, src, &dir);
         a_check_box_toggles_to_its_own_on_state(&lib, &dir);
         pages_rearrange_and_keep_links_and_outlines(&lib, src, &dir);
+        typesetting_puts_every_glyph_where_the_pdf_draws_it(&lib, &dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1553,5 +1554,74 @@ trailer << /Root 1 0 R >>\n%%EOF\n";
             let (a, b) = (text.find("Page three"), text.find("Page one"));
             assert!(a.is_some() && b.is_some() && a < b, "poppler reads: {text}");
         }
+    }
+
+    /// The writing engine's promise: the PDF draws every glyph where the
+    /// layout put it. Typeset a document with most of what Markdown offers,
+    /// read the PDF back through PDFium, and compare page by page: the same
+    /// pages, the same text in the same order, each character within a
+    /// fraction of a point of its glyph, and an outline of the headings.
+    fn typesetting_puts_every_glyph_where_the_pdf_draws_it(lib: &Lib, dir: &Path) {
+        use crate::writing::layout::Item;
+        let md = dir.join("essay.md");
+        let mut text = String::from("---\npage: A5\nalign: justify\n---\n# On Typesetting\n\n");
+        for i in 0..6 {
+            text.push_str(&format!(
+                "Paragraph {i} has *emphasis*, **strength**, `code`, a [link](https://example.com) and ~~a strike~~. \
+                 It runs long enough to wrap over several lines, so that justification has spaces to widen and the \
+                 page has to break somewhere inside the document rather than only at its end.\n\n"
+            ));
+            if i == 2 {
+                text.push_str("## A list and a quote\n\n- first point\n- second point, longer than the first\n  1. nested one\n  2. nested two\n\n> A quoted line, set in grey with a bar beside it.\n\n```\nfn main() {\n    println!(\"code\");\n}\n```\n\n---\n\n");
+            }
+        }
+        text.push_str("\\pagebreak\n\n### After a page break\n\nThe end.\n");
+        std::fs::write(&md, &text).unwrap();
+
+        let mut fs = cce_ui::create_font_system_with_system_fonts();
+        let (laid, bytes) = crate::writing::typeset(&mut fs, &md).unwrap();
+        assert!(laid.pages.len() >= 3, "expected several pages, got {}", laid.pages.len());
+        let pdf = dir.join("essay.pdf");
+        std::fs::write(&pdf, &bytes).unwrap();
+        assert!(run_ok(std::process::Command::new("qpdf").arg("--check").arg(&pdf).stdout(std::process::Stdio::null())), "qpdf --check");
+
+        let mut o = Pdf::load(lib, &pdf).unwrap();
+        assert_eq!(o.page_count(lib), laid.pages.len());
+        let (mut compared, mut worst) = (0usize, 0.0f64);
+        for (p, page) in laid.pages.iter().enumerate() {
+            let size = Frame::of(lib, o.page(lib, p).unwrap()).size();
+            assert!((size.w - laid.size.0 as f64).abs() < 0.5 && (size.h - laid.size.1 as f64).abs() < 0.5);
+            // The layout's characters in drawing order, each with where its
+            // glyph starts and its baseline (a cluster's later characters
+            // share its glyph: no position of their own).
+            let mut want: Vec<(char, Option<(f64, f64)>)> = Vec::new();
+            for item in &page.items {
+                let Item::Glyphs(run) = item else { continue };
+                for g in &run.glyphs {
+                    let cluster = &run.text[g.range.clone()];
+                    let x = (g.x + g.x_offset * run.size) as f64;
+                    for (k, c) in cluster.chars().filter(|c| !c.is_whitespace()).enumerate() {
+                        want.push((c, (k == 0 && cluster.chars().filter(|c| !c.is_whitespace()).count() == 1).then_some((x, run.baseline as f64))));
+                    }
+                }
+            }
+            let got = page_text(lib, &mut o, p);
+            let got: Vec<&TextChar> = got.chars.iter().filter(|c| !c.ch.is_whitespace() && !c.rect.is_empty()).collect();
+            let want_text: String = want.iter().map(|w| w.0).collect();
+            let got_text: String = got.iter().map(|c| c.ch).collect();
+            assert_eq!(got_text, want_text, "page {}: the PDF's text differs", p + 1);
+            for ((c, at), g) in want.iter().zip(&got) {
+                let Some((x, baseline)) = at else { continue };
+                assert!((g.rect.x0 - x).abs() < 0.75, "page {}: '{c}' at x {:.2}, laid out at {x:.2}", p + 1, g.rect.x0);
+                compared += 1;
+                worst = worst.max((g.rect.x0 - x).abs());
+                assert!(g.rect.y0 - 0.5 < *baseline && *baseline < g.rect.y1 + 0.5, "page {}: '{c}' box {:?} misses baseline {baseline:.2}", p + 1, g.rect);
+            }
+        }
+        eprintln!("typeset: {} pages, {compared} glyphs placed within {worst:.3} pt of the layout", laid.pages.len());
+        let titles: Vec<String> = outline(lib, &o).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(titles, vec!["On Typesetting".to_string()], "top level of the outline");
+        assert!(link_targets(lib, &mut o, 0).len() >= 1, "the link survives as an annotation");
+        o.close(lib);
     }
 }

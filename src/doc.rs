@@ -35,7 +35,13 @@ pub struct Document {
     /// Distinguishes this opening from every other, so late answers about
     /// a previous document are recognised and dropped.
     pub id: u64,
+    /// The file the person opened: a PDF, or a Markdown source.
     pub path: PathBuf,
+    /// The PDF the backend reads: `path` itself, or the source's typeset
+    /// copy (`writing::cache_path`).
+    pub file: PathBuf,
+    /// Typeset from Markdown: shown and exported, never edited as a PDF.
+    pub writing: bool,
     pub pages: Vec<PageSize>,
 }
 
@@ -110,7 +116,7 @@ impl Backend {
         if pages.is_empty() {
             return Err("empty PDF".to_string());
         }
-        Ok(Document { id, path: path.to_path_buf(), pages })
+        Ok(Document { id, path: path.to_path_buf(), file: path.to_path_buf(), writing: false, pages })
     }
 
     pub fn engine(&self) -> Option<&engine::Engine> {
@@ -197,7 +203,7 @@ impl PageStore {
             doc: doc.id,
             page,
             dpi,
-            path: doc.path.clone(),
+            path: doc.file.clone(),
             size: doc.pages[page],
             quarter_turns,
         };

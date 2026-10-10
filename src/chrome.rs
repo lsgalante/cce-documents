@@ -27,6 +27,9 @@ pub enum Action {
     Strike,
     Undo,
     Save,
+    Print,
+    /// Write a typeset document's PDF somewhere.
+    Export,
     // The page sidebar's own buttons.
     Insert,
     Extract,

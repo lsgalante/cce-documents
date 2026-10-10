@@ -26,6 +26,10 @@
 //! another PDF's pages (after the selection, or at the end: a merge), save
 //! the selection as a PDF of its own, turn and delete.
 //!
+//! A Markdown file (`.md`) opens typeset onto pages by the writing engine
+//! (`writing`): read-only here — edit it in any editor, and the pages follow
+//! each save. Ctrl+E exports the PDF, Ctrl+P prints (any document).
+//!
 //! Keys: o open · +/- zoom · 0 fit · 1 actual size · r/l rotate ·
 //! arrows/PageUp/PageDown/Home/End pages · Ctrl+F find · Enter/F3 next match
 //! (Shift: previous) · Esc close an editor, find, the pick, the selection or
@@ -38,11 +42,14 @@ mod doc;
 mod engine;
 mod markup;
 mod poppler;
+mod print;
 mod text;
 mod trim;
+mod writing;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
@@ -106,6 +113,10 @@ enum Message {
     Hits { generation: u64, page: usize, hits: Vec<Vec<PtRect>> },
     SearchDone { generation: u64 },
     Annots { doc: u64, page: usize, annots: Arc<Vec<markup::Annot>> },
+    /// A typeset document's Markdown changed on disk.
+    SourceChanged { doc: u64 },
+    /// The print portal's answer: sent, dismissed (false), or failed.
+    Printed { result: Result<bool, String> },
     /// A page's content changed. `dirty`: changes the file does not have.
     Edited { doc: u64, page: usize, ok: bool, dirty: bool },
     /// Anything may have changed: pages rearranged, or a step undone or
@@ -165,6 +176,14 @@ struct ThumbPress {
 
 struct DocumentsApp {
     backend: Backend,
+    /// For threads of the app's own that report back (the source watcher,
+    /// printing).
+    notify: calloop::channel::Sender<Message>,
+    /// Made on the first Markdown file.
+    typesetter: Option<writing::Typesetter>,
+    /// The document a source watcher watches; one whose document is gone
+    /// stops.
+    watching: Arc<AtomicU64>,
     store: PageStore,
     /// Thumbnails, in their own store and budget.
     thumbs: PageStore,
@@ -466,8 +485,11 @@ impl DocumentsApp {
         self.dirty = false;
         self.quit_armed = false;
         self.next_doc += 1;
-        match self.backend.open(path, self.next_doc) {
+        match self.load(path, self.next_doc) {
             Ok(d) => {
+                if d.writing {
+                    self.watch(&d.path, d.id);
+                }
                 self.doc = Some(d);
                 self.fit_page(0);
             }
@@ -479,8 +501,99 @@ impl DocumentsApp {
         self.restart_search();
     }
 
+    /// Open a file as a document: a PDF as it is, Markdown typeset first.
+    fn load(&mut self, path: &Path, id: u64) -> Result<Document, String> {
+        if !writing::is_markdown(path) {
+            return self.backend.open(path, id);
+        }
+        let pdf = self.typesetter.get_or_insert_with(writing::Typesetter::start).typeset(path)?;
+        let mut d = self.backend.open(&pdf, id)?;
+        d.path = path.to_path_buf();
+        d.writing = true;
+        Ok(d)
+    }
+
+    /// Watch a typeset document's source: a thread that polls its modified
+    /// time and says when it changed, until another document is opened.
+    fn watch(&self, path: &Path, id: u64) {
+        self.watching.store(id, Ordering::Relaxed);
+        let (path, watching, notify) = (path.to_path_buf(), Arc::clone(&self.watching), self.notify.clone());
+        let stamp = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let _ = std::thread::Builder::new().name("watch".into()).spawn(move || {
+            let mut last = stamp(&path);
+            while watching.load(Ordering::Relaxed) == id {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let now = stamp(&path);
+                if now.is_some() && now != last {
+                    last = now;
+                    if notify.send(Message::SourceChanged { doc: id }).is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Typeset the source again and show it, keeping the page and zoom. A
+    /// source that does not typeset (a save half written) keeps the pages
+    /// shown and says why.
+    fn retypeset(&mut self) {
+        let Some(path) = self.doc.as_ref().filter(|d| d.writing).map(|d| d.path.clone()) else { return };
+        if let Err(e) = self.typesetter.get_or_insert_with(writing::Typesetter::start).typeset(&path) {
+            self.status = Some(format!("Not typeset: {e}"));
+            return;
+        }
+        let (page, zoom, fit, scroll) = (self.current_page(), self.zoom, self.fit, self.scroll);
+        let (sidebar, thumb_scroll) = (self.sidebar, self.thumb_scroll);
+        self.open(&path);
+        self.sidebar = sidebar;
+        self.thumb_scroll = thumb_scroll;
+        let last = self.doc.as_ref().map_or(0, |d| d.pages.len().saturating_sub(1));
+        if fit {
+            self.fit_page(page.min(last));
+        } else {
+            self.zoom = zoom;
+            self.fit = false;
+            self.scroll = scroll;
+            self.clamp_scroll();
+        }
+        self.clamp_thumb_scroll();
+    }
+
+    /// Whether the document can be edited as a PDF: PDFium is there, and
+    /// it is not a typeset Markdown file.
+    fn editable(&self) -> bool {
+        self.backend.engine().is_some() && self.doc.as_ref().is_some_and(|d| !d.writing)
+    }
+
+    /// Save a typeset document's PDF where the person chooses.
+    fn export(&mut self) {
+        let Some(doc) = self.doc.as_ref().filter(|d| d.writing) else { return };
+        let (file, stem) = (doc.file.clone(), doc.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        let target = match cce_ui::file_dialog::save_file(&format!("Export {stem} as PDF"), &[("PDF", &["pdf"])]) {
+            Some(p) if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) => p,
+            Some(p) => p.with_extension("pdf"),
+            None => return,
+        };
+        self.status = Some(match std::fs::copy(&file, &target) {
+            Ok(_) => format!("Exported {}", target.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+            Err(e) => format!("Not exported: {e}"),
+        });
+    }
+
+    /// Print the document as a PDF: a typeset one's pages, or a PDF's file
+    /// as last saved.
+    fn print(&mut self) {
+        let Some(doc) = &self.doc else { return };
+        let title = doc.path.file_name().and_then(|n| n.to_str()).unwrap_or("Document").to_string();
+        if self.dirty && !doc.writing {
+            self.status = Some("Printing the file as last saved; your unsaved changes are not in it".to_string());
+        }
+        print::print(doc.file.clone(), title, self.notify.clone());
+    }
+
     fn open_dialog(&mut self) {
-        let filters: &[(&str, &[&str])] = &[("PDF", &["pdf"])];
+        let filters: &[(&str, &[&str])] = &[("Documents", &["pdf", "md", "markdown"]), ("PDF", &["pdf"]), ("Markdown", &["md", "markdown"])];
         if let Some(path) = cce_ui::file_dialog::pick_file("Open", filters) {
             self.open(&path);
         }
@@ -883,10 +996,11 @@ impl DocumentsApp {
 
     fn sidebar_buttons(&self) -> (Vec<Button>, Vec<Rect>) {
         let len = self.doc.as_ref().map_or(0, |d| d.pages.len());
-        let some = !self.thumb_sel.is_empty();
+        let edit = self.editable();
+        let some = edit && !self.thumb_sel.is_empty();
         let b = |label, action, enabled| Button { label, action, on: false, enabled, group: false };
         let buttons = vec![
-            b("Insert…", Action::Insert, true),
+            b("Insert…", Action::Insert, edit),
             b("Extract…", Action::Extract, some),
             b("Rotate", Action::RotatePages, some),
             b("Delete", Action::DeletePages, some && self.thumb_sel.len() < len),
@@ -944,7 +1058,7 @@ impl DocumentsApp {
             }
             return;
         }
-        let Some(gap) = gap else { return };
+        let Some(gap) = gap.filter(|_| self.editable()) else { return };
         let pages: Vec<usize> = self.thumb_sel.iter().copied().collect();
         let (Some(&first), Some(&last)) = (pages.first(), pages.last()) else { return };
         // Dropped back where it was: a contiguous run into a gap at or
@@ -1039,6 +1153,8 @@ impl DocumentsApp {
             Action::Undo => self.undo(),
             Action::Save => self.save(false),
             Action::Pages => self.toggle_sidebar(),
+            Action::Print => self.print(),
+            Action::Export => self.export(),
             Action::Insert => self.insert_pdf(),
             Action::Extract => self.extract_pages(),
             Action::RotatePages => self.rotate_pages(1),
@@ -1054,7 +1170,15 @@ impl DocumentsApp {
         }
         let has_sel = self.selection.is_some_and(|s| !s.is_empty());
         let b = |label, action, on, enabled, group| Button { label, action, on, enabled, group };
-        let buttons = vec![
+        let writing = self.doc.as_ref().is_some_and(|d| d.writing);
+        let buttons = if writing {
+            vec![
+                b("Pages", Action::Pages, self.sidebar, true, false),
+                b("Export PDF…", Action::Export, false, true, true),
+                b("Print…", Action::Print, false, true, false),
+            ]
+        } else {
+            vec![
             b("Pages", Action::Pages, self.sidebar, true, false),
             b("Select", Action::Select, self.tool == Tool::Select, true, true),
             b("Draw", Action::Draw, self.tool == Tool::Draw, true, false),
@@ -1064,7 +1188,9 @@ impl DocumentsApp {
             b("Strike", Action::Strike, false, has_sel, false),
             b("Undo", Action::Undo, false, true, true),
             b("Save", Action::Save, self.dirty, true, false),
-        ];
+            b("Print…", Action::Print, false, true, false),
+            ]
+        };
         let area = self.view_rect();
         let fs = self.font_system.get_or_insert_with(cce_ui::create_font_system);
         let rects = chrome::toolbar_layout(fs, &buttons, area);
@@ -1259,6 +1385,9 @@ impl Application for DocumentsApp {
         // The app keeps calloop's sender; `AppSender` converts into it.
         let sender: calloop::channel::Sender<Self::Message> = sender.into();
         let mut app = Self {
+            notify: sender.clone(),
+            typesetter: None,
+            watching: Arc::new(AtomicU64::new(0)),
             backend: Backend::start(sender),
             store: PageStore::new(0, PAGE_BUDGET),
             thumbs: PageStore::new(1, THUMB_BUDGET),
@@ -1384,6 +1513,20 @@ impl Application for DocumentsApp {
                     self.restructured(sizes, dirty, focus, ok);
                     *needs_rebuild = true;
                 }
+            }
+            Message::SourceChanged { doc } => {
+                if self.doc.as_ref().is_some_and(|d| d.id == doc && d.writing) {
+                    self.retypeset();
+                    *needs_rebuild = true;
+                }
+            }
+            Message::Printed { result } => {
+                match result {
+                    Ok(true) => self.status = Some("Sent to the printer".to_string()),
+                    Ok(false) => {}
+                    Err(e) => self.status = Some(format!("Not printed: {e}")),
+                }
+                *needs_rebuild = true;
             }
             Message::Quit => *exit = true,
         }
@@ -1546,7 +1689,7 @@ impl Application for DocumentsApp {
                     }
                     return None;
                 }
-                if let Some((page, x, y)) = self.page_at(px, py, false) {
+                if let Some((page, x, y)) = self.page_at(px, py, false).filter(|_| self.editable()) {
                     match self.tool {
                         Tool::Draw => {
                             self.stroke = Some((page, vec![(x, y)]));
@@ -1735,6 +1878,14 @@ impl Application for DocumentsApp {
                 self.select_all();
             } else if chord("g") {
                 self.step_match(!event.shift);
+            } else if chord("p") {
+                self.print();
+            } else if chord("e") {
+                self.export();
+            } else if !self.editable() && (chord("s") || chord("z") || chord("y")) {
+                if self.doc.as_ref().is_some_and(|d| d.writing) {
+                    self.status = Some("Edit the Markdown in your editor; the pages follow each save. Ctrl+E exports the PDF".to_string());
+                }
             } else if chord("s") {
                 self.save(event.shift);
             } else if chord("z") && event.shift || chord("y") {
@@ -1761,8 +1912,8 @@ impl Application for DocumentsApp {
                 let f = 1.0 / self.zoom;
                 self.zoom_at(f, cx, cy);
             }
-            Key::Character(c) if (c == "r" || c == "R") && self.sidebar && !self.thumb_sel.is_empty() => self.rotate_pages(1),
-            Key::Character(c) if (c == "l" || c == "L") && self.sidebar && !self.thumb_sel.is_empty() => self.rotate_pages(-1),
+            Key::Character(c) if (c == "r" || c == "R") && self.sidebar && !self.thumb_sel.is_empty() && self.editable() => self.rotate_pages(1),
+            Key::Character(c) if (c == "l" || c == "L") && self.sidebar && !self.thumb_sel.is_empty() && self.editable() => self.rotate_pages(-1),
             Key::Character(c) if c == "r" || c == "R" => self.rotate(1),
             Key::Character(c) if c == "l" || c == "L" => self.rotate(-1),
             Key::Character(c) if c == "t" => self.toggle_sidebar(),
@@ -1775,18 +1926,18 @@ impl Application for DocumentsApp {
                     return Some(Message::Quit);
                 }
             }
-            Key::Character(c) if c == "h" => self.mark_selection(MarkupKind::Highlight),
-            Key::Character(c) if c == "u" => self.mark_selection(MarkupKind::Underline),
-            Key::Character(c) if c == "s" => self.mark_selection(MarkupKind::StrikeOut),
-            Key::Character(c) if c == "d" => self.set_tool(Tool::Draw),
-            Key::Character(c) if c == "n" => self.set_tool(Tool::Note),
+            Key::Character(c) if c == "h" && self.editable() => self.mark_selection(MarkupKind::Highlight),
+            Key::Character(c) if c == "u" && self.editable() => self.mark_selection(MarkupKind::Underline),
+            Key::Character(c) if c == "s" && self.editable() => self.mark_selection(MarkupKind::StrikeOut),
+            Key::Character(c) if c == "d" && self.editable() => self.set_tool(Tool::Draw),
+            Key::Character(c) if c == "n" && self.editable() => self.set_tool(Tool::Note),
             Key::Character(c) if c == "v" => self.set_tool(Tool::Select),
             Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) if self.picked.is_some() => {
                 if let Some((page, index)) = self.picked.take() {
                     self.edit(Edit::Delete { page, index });
                 }
             }
-            Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) if self.sidebar && !self.thumb_sel.is_empty() => self.delete_pages(),
+            Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) if self.sidebar && !self.thumb_sel.is_empty() && self.editable() => self.delete_pages(),
             Key::Character(c) if c == "/" => {
                 self.open_find();
                 self.restart_search();

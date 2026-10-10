@@ -11,7 +11,9 @@ editor and word processor — proposal"
 highlight / underline / strike, ink, notes, form filling (text fields,
 check boxes, radio buttons) and incremental saves; and the page sidebar —
 thumbnails, reorder by drag, rotate, delete, insert (merge) and extract —
-with undo and redo of every kind of change.
+with undo and redo of every kind of change. Milestone 4 is here too: a
+Markdown file opens typeset onto pages (read-only; it re-typesets on each
+save of the file), exports as PDF and prints through the Print portal.
 Split from cce-preview on 2026-10-09; pictures went to cce-image.
 
 ## Shape
@@ -26,6 +28,12 @@ Split from cce-preview on 2026-10-09; pictures went to cce-image.
 | `trim.rs` | Cuts PDFium's incremental update to the objects that changed (lopdf) |
 | `text.rs` | Pure selection geometry: a page's chars with boxes, caret hit-testing, highlight rects, copied text |
 | `poppler.rs` | The fallback: `pdfinfo` sizes, `pdftoppm` renders, view-only |
+| `print.rs` | The Print portal (ashpd on its own thread): `PreparePrint`, then `Print` with the PDF's fd |
+| `writing/md.rs` | Markdown → flat blocks (pulldown-cmark), front matter, `\pagebreak` |
+| `writing/style.rs` | Page, margins, faces, spacing; the built-in `manuscript` style, user KDL styles, front-matter overrides |
+| `writing/layout.rs` | Shaping (cosmic-text) into rows, then `paginate` (keep-with-next, no orphans or widows) |
+| `writing/pdf.rs` | The pages written with krilla, glyph for glyph; outline from headings, links |
+| `writing/mod.rs` | `typeset`, the cache file, and `Typesetter`, the thread that owns the font system |
 
 ## PDFium
 
@@ -105,6 +113,39 @@ with an outline and a link: rotate, move, delete, insert, undo, redo,
 extract and save, with the link and outline still leading to the right
 pages afterwards and poppler reading the new order.
 
+## Writing (milestone 4)
+
+**The screen shows the PDF.** A Markdown document is typeset to a PDF in
+the cache (`writing::cache_path`, renamed into place) and opened through
+the ordinary PDFium page view, so what is on screen is what exports and
+prints, by construction. `Document::path` is the `.md`, `Document::file`
+the PDF the backend reads, `Document::writing` gates every PDF-editing
+path (`DocumentsApp::editable`). A thread polls the source's mtime every
+400 ms; a change re-typesets and reopens, keeping page and zoom (a
+source that fails to typeset keeps the old pages and says why).
+
+**The layout is the source of truth for glyph positions**, and the PDF
+must agree with it — milestone 5 will draw the same layout live. The
+test `typesetting_puts_every_glyph_where_the_pdf_draws_it` typesets a
+multi-page sample, reads it back through PDFium and requires the same
+pages, identical text in the same order, and every single-glyph character
+within 0.75 pt of its laid-out x (measured: 1335 glyphs within 0.121 pt).
+Things that matter for it: each krilla glyph advances to the next glyph's
+start (justification moves glyphs, it does not widen advances), runs end
+on the next run's start, and items are drawn in reading order (a list
+marker before its text — PDFium orders text by position).
+
+**Styles** live in `~/.config/cce/documents/styles/<name>.kdl` (the
+built-in `writing::style::MANUSCRIPT` is the example); page lengths in mm,
+type in pt. Front matter may override `page`, `margins`, `font`, `size`,
+`align`, `page-numbers`, and set `title` (the PDF's). Fonts are what
+cosmic-text resolves from the system (`create_font_system_with_system_fonts`
+— the bundled set alone lacks Noto Serif), embedded as subsets.
+
+Not yet: first-line indents (cosmic-text has none), tables, footnotes
+(milestone 6), and `.md` is not claimed in the desktop entry (that would
+take Markdown files from the other editors).
+
 ## Coordinates (the thing to get right)
 
 Three spaces, and each value says which it is in:
@@ -147,6 +188,8 @@ qpdf exits 3 (not 0) when it repaired a file, which the tests accept.
   for the dictionaries, and `pdftoppm` for poppler's drawing.
 - A window close quits at once (cce-ui has no close-request hook), so
   unsaved changes are only guarded on `q`.
+- Do not click Print… in a shadow either: the portal's dialog opens on the
+  live display. Printing has not been driven end to end by a test.
 - Do not click Insert… or Extract… in a shadow: they open the portal file
   chooser, which appears on the LIVE display (the shadow shares the
   session bus). The engine test covers what they do.
