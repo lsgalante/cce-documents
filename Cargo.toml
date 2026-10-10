@@ -19,3 +19,10 @@ env_logger = "0.11"
 pdfium-render = { version = "0.9.4", default-features = false, features = ["pdfium_7881", "thread_safe"] }
 # Trims PDFium's incremental updates to the objects that changed (src/trim.rs).
 lopdf = { version = "0.45.0", default-features = false }
+# The writing engine: Markdown in, PDF out. pulldown-cmark parses (parser
+# only), krilla writes the pages from cosmic-text's shaped glyphs (its own
+# shaping is not needed; raster-images embeds PNG and JPEG pictures), kdl
+# reads styles.
+pulldown-cmark = { version = "0.13.4", default-features = false }
+krilla = { version = "0.8.2", default-features = false, features = ["raster-images"] }
+kdl = "6.7.1"
