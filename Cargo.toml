@@ -26,3 +26,8 @@ lopdf = { version = "0.45.0", default-features = false }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 krilla = { version = "0.8.2", default-features = false, features = ["raster-images"] }
 kdl = "6.7.1"
+# Printing goes through the desktop's Print portal (cce-desktop-portal), with
+# the same ashpd build and blocking executor rfd already brings in for
+# cce-ui's file dialogs.
+ashpd = { version = "0.11.1", default-features = false, features = ["async-std"] }
+pollster = "0.4.0"
