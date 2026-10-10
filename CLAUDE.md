@@ -11,9 +11,11 @@ editor and word processor — proposal"
 highlight / underline / strike, ink, notes, form filling (text fields,
 check boxes, radio buttons) and incremental saves; and the page sidebar —
 thumbnails, reorder by drag, rotate, delete, insert (merge) and extract —
-with undo and redo of every kind of change. Milestone 4 is here too: a
-Markdown file opens typeset onto pages (read-only; it re-typesets on each
-save of the file), exports as PDF and prints through the Print portal.
+with undo and redo of every kind of change. Milestones 4 and 5 are here
+too: a Markdown file opens typeset onto pages and is edited right there
+(caret, selection, undo, markup hidden, formatting shortcuts, autosave, an
+outline, a word count), exports as PDF and prints through the Print
+portal.
 Split from cce-preview on 2026-10-09; pictures went to cce-image.
 
 ## Shape
@@ -29,11 +31,14 @@ Split from cce-preview on 2026-10-09; pictures went to cce-image.
 | `text.rs` | Pure selection geometry: a page's chars with boxes, caret hit-testing, highlight rects, copied text |
 | `poppler.rs` | The fallback: `pdfinfo` sizes, `pdftoppm` renders, view-only |
 | `print.rs` | The Print portal (ashpd on its own thread): `PreparePrint`, then `Print` with the PDF's fd |
+| `editor.rs` | Editing a Markdown document: the text in cce-ui's `DocEditor` `Buffer`, every operation in file bytes and visible characters, autosave |
 | `writing/md.rs` | Markdown → flat blocks (pulldown-cmark), front matter, `\pagebreak` |
 | `writing/style.rs` | Page, margins, faces, spacing; the built-in `manuscript` style, user KDL styles, front-matter overrides |
-| `writing/layout.rs` | Shaping (cosmic-text) into rows, then `paginate` (keep-with-next, no orphans or widows) |
+| `writing/layout.rs` | Shaping (cosmic-text) into rows, then `flow` (resumable pagination: keep-with-next, no orphans or widows) |
+| `writing/edit.rs` | `Layouter` (incremental relayout: shape cache, pagination resumed at the first changed block, changed pages) and `Doc`, the geometry the caret needs |
+| `writing/raster.rs` | A page of the layout drawn into pixels (swash), and `Painter`, the thread that draws edited pages |
 | `writing/pdf.rs` | The pages written with krilla, glyph for glyph; outline from headings, links |
-| `writing/mod.rs` | `typeset`, the cache file, and `Typesetter`, the thread that owns the font system |
+| `writing/mod.rs` | `typeset_text` (the PDF from text, through the same `Layouter`) and the print cache path |
 
 ## PDFium
 
@@ -113,38 +118,56 @@ with an outline and a link: rotate, move, delete, insert, undo, redo,
 extract and save, with the link and outline still leading to the right
 pages afterwards and poppler reading the new order.
 
-## Writing (milestone 4)
+## Writing (milestones 4 and 5)
 
-**The screen shows the PDF.** A Markdown document is typeset to a PDF in
-the cache (`writing::cache_path`, renamed into place) and opened through
-the ordinary PDFium page view, so what is on screen is what exports and
-prints, by construction. `Document::path` is the `.md`, `Document::file`
-the PDF the backend reads, `Document::writing` gates every PDF-editing
-path (`DocumentsApp::editable`). A thread polls the source's mtime every
-400 ms; a change re-typesets and reopens, keeping page and zoom (a
-source that fails to typeset keeps the old pages and says why).
+**One layout, two outputs.** `writing::edit::Layouter` lays the Markdown
+out; the page view draws it with `raster` (swash glyphs, on the `Painter`
+thread) and export and print write it with `pdf` (krilla). The test
+`typesetting_puts_every_glyph_where_the_pdf_draws_it` reads the PDF back
+through PDFium and requires identical text and every glyph within 0.75 pt
+of the layout (measured 0.121 pt), so screen and paper agree. The screen
+snaps baselines to whole pixels and corrects glyph coverage (gamma 1/1.4);
+the PDF keeps exact positions.
 
-**The layout is the source of truth for glyph positions**, and the PDF
-must agree with it — milestone 5 will draw the same layout live. The
-test `typesetting_puts_every_glyph_where_the_pdf_draws_it` typesets a
-multi-page sample, reads it back through PDFium and requires the same
-pages, identical text in the same order, and every single-glyph character
-within 0.75 pt of its laid-out x (measured: 1335 glyphs within 0.121 pt).
-Things that matter for it: each krilla glyph advances to the next glyph's
-start (justification moves glyphs, it does not widen advances), runs end
-on the next run's start, and items are drawn in reading order (a list
-marker before its text — PDFium orders text by position).
+**Editing is in file bytes, shown as text.** The caret is a byte of the
+`.md`; markup is hidden. `md` records anchors (text offset → file byte) on
+every span, `BlockLay::source_of`/`text_of` map both ways, and a byte in
+the gap between blocks (blank line, `## `, a trimmed space) belongs to the
+block after it. Stops are every character boundary (a wrapped line's space
+has no glyph but is a character). Backspace at a block's start joins it to
+the one before, removing the break and its markup but keeping plain spaces
+(split-then-join restores the file byte for byte). Enter: a paragraph, the
+next list item (`editor::next_item_prefix`), or a line in code. The caret at
+a style boundary takes the left side (typing after a bold word's last
+letter stays bold; after a space before it, plain).
+
+**Incremental.** Shapes are cached by content (`shape_key`, never position),
+pagination resumes at the first changed block (or the heading before it),
+and `Changes` lists only pages whose rows moved. One keystroke in a 35-page
+document: one block reshaped, one page redrawn, 1.6 ms, and the result
+equals a fresh layout (`typing_in_a_long_document_...`).
+
+**Saving.** 1.5 s after typing stops (`editor::AUTOSAVE`, a real-time
+deadline polled through `idle_poll_interval` — `tick`'s dt is not wall
+clock), on Ctrl+S, before Ctrl+Q. The source watcher ignores its own saves
+(file == `Editor::disk`), reloads clean documents changed elsewhere, and
+says so instead when there are unsaved edits.
+
+**Not in cce-ui (yet).** The plan put the paged layout into `DocEditor`;
+another session held cce-ui at the time, so the editor lives here and
+uses only `DocEditor`'s public `Buffer` (feature `doc_editor`). Moving the
+paged layout into cce-ui is open.
 
 **Styles** live in `~/.config/cce/documents/styles/<name>.kdl` (the
 built-in `writing::style::MANUSCRIPT` is the example); page lengths in mm,
 type in pt. Front matter may override `page`, `margins`, `font`, `size`,
-`align`, `page-numbers`, and set `title` (the PDF's). Fonts are what
-cosmic-text resolves from the system (`create_font_system_with_system_fonts`
-— the bundled set alone lacks Noto Serif), embedded as subsets.
+`align`, `page-numbers`, and set `title` (the PDF's). Fonts come from the
+system (`create_font_system_with_system_fonts`, shared by layout and
+painter in one `Arc<Mutex<FontSystem>>`: glyph ids are per font system).
 
-Not yet: first-line indents (cosmic-text has none), tables, footnotes
-(milestone 6), and `.md` is not claimed in the desktop entry (that would
-take Markdown files from the other editors).
+Not yet: search in a writing document (find is PDFium's), first-line
+indents, tables and footnotes (milestone 6); `.md` is not claimed in the
+desktop entry.
 
 ## Coordinates (the thing to get right)
 

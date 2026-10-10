@@ -27,8 +27,13 @@
 //! the selection as a PDF of its own, turn and delete.
 //!
 //! A Markdown file (`.md`) opens typeset onto pages by the writing engine
-//! (`writing`): read-only here — edit it in any editor, and the pages follow
-//! each save. Ctrl+E exports the PDF, Ctrl+P prints (any document).
+//! (`writing`), and is edited right there (`editor`): click to place the
+//! caret, type, select, copy and paste, with the markup hidden — Ctrl+B,
+//! Ctrl+I and Ctrl+` wrap the selection in bold, italic or code, Ctrl+Alt+1
+//! to 3 make a heading (0 a paragraph again), Enter continues a list. It
+//! saves itself shortly after typing stops, and follows the file when
+//! another program changes it. The sidebar shows its outline. Ctrl+E
+//! exports the PDF, Ctrl+P prints (any document).
 //!
 //! Keys: o open · +/- zoom · 0 fit · 1 actual size · r/l rotate ·
 //! arrows/PageUp/PageDown/Home/End pages · Ctrl+F find · Enter/F3 next match
@@ -39,6 +44,7 @@
 
 mod chrome;
 mod doc;
+mod editor;
 mod engine;
 mod markup;
 mod poppler;
@@ -50,7 +56,7 @@ mod writing;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cce_ui::engine::{Application, LogicalPosition, LogicalSize, WindowSettings};
 use cce_ui::scene::layout::Rect;
@@ -62,7 +68,7 @@ use cce_ui::widget::{ElementState, Key, KeyEvent, LineEdit, MouseButton, MouseSc
 use std::collections::BTreeSet;
 
 use chrome::{Action, Button, FieldLook};
-use doc::{Backend, Document, PageStore, Rendered, PAGE_BUDGET, THUMB_BUDGET};
+use doc::{Backend, Document, PageStore, Render, Rendered, PAGE_BUDGET, THUMB_BUDGET};
 use markup::{annot_at, move_dest, Annot, AnnotKind, Edit, FieldKind, MarkupKind, PageOp};
 use text::{Mark, PageText, PtRect, Selection};
 
@@ -179,8 +185,11 @@ struct DocumentsApp {
     /// For threads of the app's own that report back (the source watcher,
     /// printing).
     notify: calloop::channel::Sender<Message>,
-    /// Made on the first Markdown file.
-    typesetter: Option<writing::Typesetter>,
+    /// The Markdown document being edited, when one is open.
+    writer: Option<editor::Editor>,
+    /// The font system writing documents are laid out and drawn with,
+    /// made on the first one (slow: it reads every system font).
+    fonts: Option<Arc<Mutex<cce_ui::cosmic_text::FontSystem>>>,
     /// The document a source watcher watches; one whose document is gone
     /// stops.
     watching: Arc<AtomicU64>,
@@ -482,6 +491,7 @@ impl DocumentsApp {
         self.picked = None;
         self.stroke = None;
         self.editor = None;
+        self.writer = None;
         self.dirty = false;
         self.quit_armed = false;
         self.next_doc += 1;
@@ -501,16 +511,142 @@ impl DocumentsApp {
         self.restart_search();
     }
 
-    /// Open a file as a document: a PDF as it is, Markdown typeset first.
+    /// Open a file as a document: a PDF as it is, Markdown into the editor.
     fn load(&mut self, path: &Path, id: u64) -> Result<Document, String> {
         if !writing::is_markdown(path) {
             return self.backend.open(path, id);
         }
-        let pdf = self.typesetter.get_or_insert_with(writing::Typesetter::start).typeset(path)?;
-        let mut d = self.backend.open(&pdf, id)?;
-        d.path = path.to_path_buf();
-        d.writing = true;
-        Ok(d)
+        let fs = Arc::clone(self.fonts.get_or_insert_with(|| Arc::new(Mutex::new(cce_ui::create_font_system_with_system_fonts()))));
+        let w = editor::Editor::open(path, fs, self.notify.clone())?;
+        let (pw, ph) = w.doc.size();
+        let pages = vec![doc::PageSize { w: pw as f64, h: ph as f64 }; w.doc.page_count];
+        self.writer = Some(w);
+        Ok(Document { id, path: path.to_path_buf(), file: path.to_path_buf(), writing: true, pages })
+    }
+
+    /// Take in an edit's new layout: the page count, the pages to draw
+    /// again, and the caret kept in view.
+    fn take_changes(&mut self, changes: writing::edit::Changes) {
+        let Some(w) = &self.writer else { return };
+        let (pw, ph) = w.doc.size();
+        let count = w.doc.page_count;
+        self.dirty = w.dirty;
+        if let Some(d) = &mut self.doc {
+            d.pages = vec![doc::PageSize { w: pw as f64, h: ph as f64 }; count];
+        }
+        if changes.all {
+            // Old images stay up until the new ones land.
+            self.store.invalidate_all();
+        } else {
+            for p in changes.pages {
+                self.store.invalidate(p);
+            }
+        }
+        self.clamp_scroll();
+        self.reveal_caret();
+    }
+
+    /// Scroll as little as needed to show the caret, clear of the toolbar.
+    fn reveal_caret(&mut self) {
+        let Some(c) = self.writer.as_ref().and_then(|w| w.doc.caret(w.caret())) else { return };
+        let (rects, cw, ch) = self.layout();
+        let origin = self.origin(cw, ch);
+        let s = self.screen_rect(&rects, origin, c.page, &PtRect { x0: c.x as f64, y0: c.y as f64, x1: c.x as f64 + 1.0, y1: (c.y + c.h) as f64 });
+        let (top, bottom) = (24.0, self.win.1 - 96.0);
+        if s.y < top {
+            self.scroll.1 -= (top - s.y) as f64;
+        } else if s.y + s.height > bottom {
+            self.scroll.1 += (s.y + s.height - bottom) as f64;
+        }
+        let (x0, x1) = (self.view_x() as f32 + 16.0, (self.view_x() + self.view_w()) as f32 - 16.0);
+        if s.x < x0 {
+            self.scroll.0 -= (x0 - s.x) as f64;
+        } else if s.x > x1 {
+            self.scroll.0 += (s.x - x1) as f64;
+        }
+        self.clamp_scroll();
+    }
+
+    /// Save the Markdown being edited.
+    fn save_writer(&mut self) {
+        let Some(w) = &mut self.writer else { return };
+        match w.save() {
+            Ok(()) => self.dirty = false,
+            Err(e) => self.status = Some(format!("Not saved: {e}")),
+        }
+    }
+
+    /// A key while a Markdown document is being edited. Some(..) when the
+    /// editor took it (with what the app should do next).
+    fn writer_key(&mut self, event: &KeyEvent) -> Option<Option<Message>> {
+        let (ctrl, shift) = (event.ctrl, event.shift);
+        let is = |c: &str| matches!(&event.logical_key, Key::Character(k) if k.eq_ignore_ascii_case(c));
+        let w = self.writer.as_mut()?;
+        let mut changes = None;
+        match &event.logical_key {
+            Key::Named(NamedKey::ArrowLeft) if ctrl => w.word(false, shift),
+            Key::Named(NamedKey::ArrowRight) if ctrl => w.word(true, shift),
+            Key::Named(NamedKey::ArrowLeft) => w.step(false, shift),
+            Key::Named(NamedKey::ArrowRight) => w.step(true, shift),
+            Key::Named(NamedKey::ArrowUp) => w.vertical(false, shift),
+            Key::Named(NamedKey::ArrowDown) => w.vertical(true, shift),
+            Key::Named(NamedKey::Home) if ctrl => {
+                let s = w.doc_start();
+                w.set_caret(s, shift);
+            }
+            Key::Named(NamedKey::End) if ctrl => {
+                let e = w.doc_end();
+                w.set_caret(e, shift);
+            }
+            Key::Named(NamedKey::Home) => w.row_edge(false, shift),
+            Key::Named(NamedKey::End) => w.row_edge(true, shift),
+            Key::Named(NamedKey::Backspace) => changes = w.delete(false),
+            Key::Named(NamedKey::Delete) => changes = w.delete(true),
+            Key::Named(NamedKey::Enter) => changes = Some(w.enter()),
+            Key::Named(NamedKey::Tab) => {}
+            Key::Named(NamedKey::Escape) if w.selection().is_some() => {
+                let c = w.caret();
+                w.set_caret(c, false);
+            }
+            Key::Character(_) if ctrl && event.alt => {
+                let level = ["0", "1", "2", "3"].iter().position(|d| is(d))?;
+                changes = w.heading(level as u8);
+            }
+            Key::Character(_) if ctrl && is("a") => w.select_all(),
+            Key::Character(_) if ctrl && (is("c") || is("x")) => {
+                if let Some(text) = w.copy() {
+                    cce_ui::widget::clipboard::copy_to_clipboard(&text);
+                    if is("x") {
+                        changes = w.delete(false);
+                    }
+                }
+            }
+            Key::Character(_) if ctrl && is("v") => {
+                if let Some(text) = cce_ui::widget::clipboard::read_from_clipboard() {
+                    changes = Some(w.type_text(&text));
+                }
+            }
+            Key::Character(_) if ctrl && is("z") => changes = w.undo(shift),
+            Key::Character(_) if ctrl && is("y") => changes = w.undo(true),
+            Key::Character(_) if ctrl && is("b") => changes = Some(w.wrap("**")),
+            Key::Character(_) if ctrl && is("i") => changes = Some(w.wrap("*")),
+            Key::Character(_) if ctrl && is("`") => changes = Some(w.wrap("`")),
+            Key::Character(_) if ctrl && is("s") => {
+                self.save_writer();
+                return Some(None);
+            }
+            // Other chords are the app's (open, print, export, zoom, quit).
+            _ if ctrl => return None,
+            _ => match event.text.as_deref().filter(|t| !t.is_empty() && !t.chars().any(char::is_control)) {
+                Some(text) => changes = Some(w.type_text(text)),
+                None => return None,
+            },
+        }
+        match changes {
+            Some(ch) => self.take_changes(ch),
+            None => self.reveal_caret(),
+        }
+        Some(None)
     }
 
     /// Watch a typeset document's source: a thread that polls its modified
@@ -534,62 +670,115 @@ impl DocumentsApp {
         });
     }
 
-    /// Typeset the source again and show it, keeping the page and zoom. A
-    /// source that does not typeset (a save half written) keeps the pages
-    /// shown and says why.
-    fn retypeset(&mut self) {
-        let Some(path) = self.doc.as_ref().filter(|d| d.writing).map(|d| d.path.clone()) else { return };
-        if let Err(e) = self.typesetter.get_or_insert_with(writing::Typesetter::start).typeset(&path) {
-            self.status = Some(format!("Not typeset: {e}"));
-            return;
-        }
-        let (page, zoom, fit, scroll) = (self.current_page(), self.zoom, self.fit, self.scroll);
-        let (sidebar, thumb_scroll) = (self.sidebar, self.thumb_scroll);
-        self.open(&path);
-        self.sidebar = sidebar;
-        self.thumb_scroll = thumb_scroll;
-        let last = self.doc.as_ref().map_or(0, |d| d.pages.len().saturating_sub(1));
-        if fit {
-            self.fit_page(page.min(last));
-        } else {
-            self.zoom = zoom;
-            self.fit = false;
-            self.scroll = scroll;
-            self.clamp_scroll();
-        }
-        self.clamp_thumb_scroll();
-    }
-
     /// Whether the document can be edited as a PDF: PDFium is there, and
     /// it is not a typeset Markdown file.
     fn editable(&self) -> bool {
         self.backend.engine().is_some() && self.doc.as_ref().is_some_and(|d| !d.writing)
     }
 
-    /// Save a typeset document's PDF where the person chooses.
+    /// Save the Markdown document's pages as a PDF where the person chooses.
     fn export(&mut self) {
-        let Some(doc) = self.doc.as_ref().filter(|d| d.writing) else { return };
-        let (file, stem) = (doc.file.clone(), doc.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        let Some(w) = &self.writer else { return };
+        let stem = w.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let target = match cce_ui::file_dialog::save_file(&format!("Export {stem} as PDF"), &[("PDF", &["pdf"])]) {
             Some(p) if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) => p,
             Some(p) => p.with_extension("pdf"),
             None => return,
         };
-        self.status = Some(match std::fs::copy(&file, &target) {
-            Ok(_) => format!("Exported {}", target.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
+        let Some(w) = &self.writer else { return };
+        self.status = Some(match w.pdf().and_then(|bytes| std::fs::write(&target, bytes).map_err(|e| e.to_string())) {
+            Ok(()) => format!("Exported {}", target.file_name().and_then(|n| n.to_str()).unwrap_or("?")),
             Err(e) => format!("Not exported: {e}"),
         });
     }
 
-    /// Print the document as a PDF: a typeset one's pages, or a PDF's file
-    /// as last saved.
+    /// Print the document: a Markdown one's pages as they are now, or a
+    /// PDF's file as last saved.
     fn print(&mut self) {
         let Some(doc) = &self.doc else { return };
         let title = doc.path.file_name().and_then(|n| n.to_str()).unwrap_or("Document").to_string();
-        if self.dirty && !doc.writing {
-            self.status = Some("Printing the file as last saved; your unsaved changes are not in it".to_string());
+        let file = match &self.writer {
+            Some(w) => {
+                let out = writing::cache_path(&w.path);
+                let written = w.pdf().and_then(|bytes| {
+                    std::fs::create_dir_all(out.parent().unwrap_or(Path::new("."))).map_err(|e| e.to_string())?;
+                    std::fs::write(&out, bytes).map_err(|e| e.to_string())
+                });
+                if let Err(e) = written {
+                    self.status = Some(format!("Not printed: {e}"));
+                    return;
+                }
+                out
+            }
+            None => {
+                if self.dirty {
+                    self.status = Some("Printing the file as last saved; your unsaved changes are not in it".to_string());
+                }
+                doc.file.clone()
+            }
+        };
+        print::print(file, title, self.notify.clone());
+    }
+
+    /// The outline's entries' rects in the sidebar.
+    fn outline_rects(&self) -> Vec<Rect> {
+        let n = self.writer.as_ref().map_or(0, |w| w.doc.outline.len());
+        (0..n).map(|i| Rect { x: 8.0, y: 44.0 + i as f32 * 26.0 - self.thumb_scroll as f32, width: SIDEBAR_W - 16.0, height: 24.0 }).collect()
+    }
+
+    /// The outline entry the view is in: the last heading above the
+    /// reading line, a third of the way down the window.
+    fn current_section(&self) -> Option<usize> {
+        let w = self.writer.as_ref()?;
+        let (rects, cw, ch) = self.layout();
+        let (_, oy) = self.origin(cw, ch);
+        let line = (self.win.1 as f64 / 3.0 - oy) / self.zoom;
+        let page = rects.iter().rposition(|r| r.y <= line).unwrap_or(0);
+        let y = (line - rects.get(page).map_or(0.0, |r| r.y)) as f32;
+        w.doc.outline.iter().rposition(|e| e.page < page || (e.page == page && e.y <= y)).or(Some(0)).filter(|_| !w.doc.outline.is_empty())
+    }
+
+    fn paint_outline(&mut self, pc: &mut PaintCtx) {
+        let h = self.win.1;
+        pc.quad(Rect { x: 0.0, y: 0.0, width: SIDEBAR_W, height: h }, [0.105, 0.105, 0.115, 1.0]);
+        pc.quad(Rect { x: SIDEBAR_W - 1.0, y: 0.0, width: 1.0, height: h }, [1.0, 1.0, 1.0, 0.08]);
+        pc.text("Outline".to_string(), 16.0, 14.0, 13.0, [200, 200, 200]);
+        let Some(w) = &self.writer else { return };
+        if w.doc.outline.is_empty() {
+            pc.text("No headings yet".to_string(), 16.0, 48.0, 12.0, [130, 130, 130]);
+            return;
         }
-        print::print(doc.file.clone(), title, self.notify.clone());
+        let current = self.current_section();
+        let rects = self.outline_rects();
+        let entries: Vec<(u8, String)> = w.doc.outline.iter().map(|e| (e.level, e.title.clone())).collect();
+        pc.push_clip(Rect { x: 0.0, y: 38.0, width: SIDEBAR_W - 1.0, height: (h - 38.0).max(0.0) });
+        for (i, ((level, title), r)) in entries.into_iter().zip(rects).enumerate() {
+            if current == Some(i) {
+                pc.rounded_rect(r, 6.0, (true, true, true, true), [1.0, 1.0, 1.0, 0.12]);
+            }
+            let x = r.x + 8.0 + (level.saturating_sub(1)) as f32 * 14.0;
+            let color = if level == 1 { [235, 235, 235] } else { [200, 200, 200] };
+            pc.clip(r, |pc| pc.text(title, x, r.y + 5.0, 12.5, color));
+        }
+        pc.pop_clip();
+    }
+
+    /// A press in the outline: go to that heading, and put the caret there.
+    fn outline_press(&mut self, x: f64, y: f64) {
+        let Some(i) = self.outline_rects().iter().position(|r| x as f32 >= r.x && x as f32 <= r.x + r.width && y as f32 >= r.y && y as f32 <= r.y + r.height) else { return };
+        let Some(w) = &mut self.writer else { return };
+        let Some(entry) = w.doc.outline.get(i).cloned() else { return };
+        // The i-th heading block is the i-th outline entry.
+        if let Some(b) = w.doc.blocks.iter().filter(|b| matches!(b.kind, writing::edit::Kind::Heading(_))).nth(i) {
+            let src = b.source_of(0, false);
+            w.set_caret(src, false);
+        }
+        let (rects, _, _) = self.layout();
+        if let Some(r) = rects.get(entry.page) {
+            self.scroll.1 = (r.y + entry.y as f64) * self.zoom - 40.0;
+            self.fit = false;
+            self.clamp_scroll();
+        }
     }
 
     fn open_dialog(&mut self) {
@@ -961,7 +1150,10 @@ impl DocumentsApp {
     }
 
     fn clamp_thumb_scroll(&mut self) {
-        let content: f64 = self.doc.as_ref().map_or(0.0, |d| d.pages.iter().map(|p| Self::thumb_size(*p).1 + THUMB_GAP).sum::<f64>() + 14.0);
+        let content: f64 = match &self.writer {
+            Some(w) => 44.0 + w.doc.outline.len() as f64 * 26.0 - SIDEBAR_HEADER as f64,
+            None => self.doc.as_ref().map_or(0.0, |d| d.pages.iter().map(|p| Self::thumb_size(*p).1 + THUMB_GAP).sum::<f64>() + 14.0),
+        };
         let room = self.win.1 as f64 - SIDEBAR_HEADER as f64;
         self.thumb_scroll = self.thumb_scroll.clamp(0.0, (content - room).max(0.0));
     }
@@ -1014,6 +1206,9 @@ impl DocumentsApp {
 
     fn sidebar_press(&mut self, x: f64, y: f64) {
         self.commit_editor();
+        if self.writer.is_some() {
+            return self.outline_press(x, y);
+        }
         if (y as f32) < SIDEBAR_HEADER {
             let (buttons, rects) = self.sidebar_buttons();
             if let Some(action) = chrome::button_at(&buttons, &rects, x as f32, y as f32) {
@@ -1071,6 +1266,9 @@ impl DocumentsApp {
     }
 
     fn paint_sidebar(&mut self, pc: &mut PaintCtx, scale: f64) {
+        if self.writer.is_some() {
+            return self.paint_outline(pc);
+        }
         let h = self.win.1;
         pc.quad(Rect { x: 0.0, y: 0.0, width: SIDEBAR_W, height: h }, [0.105, 0.105, 0.115, 1.0]);
         pc.quad(Rect { x: SIDEBAR_W - 1.0, y: 0.0, width: 1.0, height: h }, [1.0, 1.0, 1.0, 0.08]);
@@ -1173,7 +1371,7 @@ impl DocumentsApp {
         let writing = self.doc.as_ref().is_some_and(|d| d.writing);
         let buttons = if writing {
             vec![
-                b("Pages", Action::Pages, self.sidebar, true, false),
+                b("Outline", Action::Pages, self.sidebar, true, false),
                 b("Export PDF…", Action::Export, false, true, true),
                 b("Print…", Action::Print, false, true, false),
             ]
@@ -1299,6 +1497,18 @@ impl DocumentsApp {
     /// Draw what sits over the pages: the picked mark, ink being drawn, a
     /// note's text under the pointer, an open editor.
     fn paint_overlays(&mut self, pc: &mut PaintCtx, rects: &[PageRect], origin: (f64, f64)) {
+        if let Some(w) = &self.writer {
+            if let Some((a, z)) = w.selection() {
+                for (page, x, y, sw, sh) in w.doc.selection(a, z) {
+                    let r = PtRect { x0: x as f64, y0: y as f64, x1: (x + sw) as f64, y1: (y + sh) as f64 };
+                    pc.quad(self.screen_rect(rects, origin, page, &r), SELECTION);
+                }
+            }
+            if let Some(c) = w.doc.caret(w.caret()) {
+                let r = self.screen_rect(rects, origin, c.page, &PtRect { x0: c.x as f64, y0: c.y as f64, x1: c.x as f64, y1: (c.y + c.h) as f64 });
+                pc.quad(Rect { x: r.x - 0.75, y: r.y, width: 1.5, height: r.height }, [0.1, 0.1, 0.1, 0.95]);
+            }
+        }
         if let Some((page, index)) = self.picked {
             if let Some(a) = self.annots.get(&page).and_then(|l| l.iter().find(|a| a.index == index)) {
                 let r = self.screen_rect(rects, origin, page, &a.rect);
@@ -1386,7 +1596,8 @@ impl Application for DocumentsApp {
         let sender: calloop::channel::Sender<Self::Message> = sender.into();
         let mut app = Self {
             notify: sender.clone(),
-            typesetter: None,
+            writer: None,
+            fonts: None,
             watching: Arc::new(AtomicU64::new(0)),
             backend: Backend::start(sender),
             store: PageStore::new(0, PAGE_BUDGET),
@@ -1515,8 +1726,23 @@ impl Application for DocumentsApp {
                 }
             }
             Message::SourceChanged { doc } => {
-                if self.doc.as_ref().is_some_and(|d| d.id == doc && d.writing) {
-                    self.retypeset();
+                if self.doc.as_ref().is_some_and(|d| d.id == doc) {
+                    let changes = match &mut self.writer {
+                        Some(w) => match std::fs::read_to_string(&w.path) {
+                            // Our own save coming back, or no change.
+                            Ok(text) if text == w.disk => None,
+                            Ok(_) if w.dirty => {
+                                self.status = Some("The file changed on disk as well: Ctrl+S keeps your version".to_string());
+                                None
+                            }
+                            Ok(text) => Some(w.reload(text)),
+                            Err(_) => None,
+                        },
+                        None => None,
+                    };
+                    if let Some(ch) = changes {
+                        self.take_changes(ch);
+                    }
                     *needs_rebuild = true;
                 }
             }
@@ -1532,7 +1758,16 @@ impl Application for DocumentsApp {
         }
     }
 
+    fn idle_poll_interval(&self) -> Option<std::time::Duration> {
+        // A pending autosave is a real-time deadline the loop cannot see.
+        self.writer.as_ref().and_then(|w| w.save_due).map(|_| std::time::Duration::from_millis(250))
+    }
+
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
+        if self.writer.as_ref().and_then(|w| w.save_due).is_some_and(|due| std::time::Instant::now() >= due) {
+            self.save_writer();
+            *needs_rebuild = true;
+        }
         if self.tick_scroll(dt) {
             *needs_rebuild = true;
         }
@@ -1617,6 +1852,18 @@ impl Application for DocumentsApp {
             self.pointer = (px, py);
             return;
         }
+        if self.selecting && self.writer.is_some() {
+            if let Some((page, x, y)) = self.page_at(px, py, true) {
+                if let Some(w) = self.writer.as_mut() {
+                    if let Some(src) = w.doc.hit(page, x as f32, y as f32) {
+                        w.set_caret(src, true);
+                    }
+                }
+                *needs_rebuild = true;
+            }
+            self.pointer = (px, py);
+            return;
+        }
         if self.tool == Tool::Select && !self.selecting && self.drag.is_none() {
             // The note under the pointer shows its text.
             *needs_rebuild = true;
@@ -1673,6 +1920,20 @@ impl Application for DocumentsApp {
                 }
                 if in_find {
                     self.commit_editor();
+                    return None;
+                }
+                // Writing: a press places the caret (Shift extends the
+                // selection), and a drag selects.
+                if self.writer.is_some() {
+                    if let Some((page, x, y)) = self.page_at(px, py, true) {
+                        let shift = self.shift;
+                        if let Some(w) = self.writer.as_mut() {
+                            if let Some(src) = w.doc.hit(page, x as f32, y as f32) {
+                                w.set_caret(src, shift);
+                            }
+                        }
+                        self.selecting = true;
+                    }
                     return None;
                 }
                 // An open editor: a press in it places the caret, a press
@@ -1822,6 +2083,15 @@ impl Application for DocumentsApp {
             self.quit_armed = false;
         }
 
+        // A Markdown document being edited takes the keys first (the find
+        // field aside), leaving the app the chords it does not own.
+        if self.writer.is_some() && !self.find.as_ref().is_some_and(|f| f.focused) {
+            if let Some(out) = self.writer_key(event) {
+                *needs_rebuild = true;
+                return out;
+            }
+        }
+
         // An editor over the page has the keyboard: Enter keeps the text,
         // Escape drops it; chords it does not own (Ctrl+S) fall through.
         if self.editor.is_some() && !chord("s") {
@@ -1878,6 +2148,21 @@ impl Application for DocumentsApp {
                 self.select_all();
             } else if chord("g") {
                 self.step_match(!event.shift);
+            } else if chord("o") {
+                self.open_dialog();
+            } else if chord("q") {
+                if self.writer.as_ref().is_some_and(|w| w.dirty) {
+                    self.save_writer();
+                }
+                return Some(Message::Quit);
+            } else if chord("=") || chord("+") {
+                let (cx, cy) = (self.view_x() + self.view_w() / 2.0, self.win.1 as f64 / 2.0);
+                self.zoom_at(1.25, cx, cy);
+            } else if chord("-") {
+                let (cx, cy) = (self.view_x() + self.view_w() / 2.0, self.win.1 as f64 / 2.0);
+                self.zoom_at(0.8, cx, cy);
+            } else if chord("0") {
+                self.fit_page(self.current_page());
             } else if chord("p") {
                 self.print();
             } else if chord("e") {
@@ -2021,7 +2306,11 @@ impl Application for DocumentsApp {
                 [0.0, 0.0, 0.0, 0.35],
             );
             pc.quad(*rect, [0.97, 0.97, 0.97, 1.0]);
-            if let Some(r) = self.store.ensure(&self.backend, &doc, self.quarter_turns, *i, want_dpi) {
+            let render: &dyn Render = match &self.writer {
+                Some(w) => &w.painter,
+                None => &self.backend,
+            };
+            if let Some(r) = self.store.ensure(render, &doc, self.quarter_turns, *i, want_dpi) {
                 pc.image(r.image, *rect, 1.0);
             }
         }
@@ -2065,6 +2354,9 @@ impl Application for DocumentsApp {
         let mut hud = name.to_string();
         if doc.pages.len() > 1 {
             hud.push_str(&format!("   ·   page {}/{}", self.current_page() + 1, doc.pages.len()));
+        }
+        if let Some(w) = &self.writer {
+            hud.push_str(&format!("   ·   {} words", w.doc.words));
         }
         hud.push_str(&format!("   ·   {:.0}%", self.zoom * 100.0));
         // The HUD stands the root plate's inset off the window corner, its

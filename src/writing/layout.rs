@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
-use cce_ui::cosmic_text::{self, fontdb, Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Weight, Wrap};
+use cce_ui::cosmic_text::{self, fontdb, Attrs, Buffer, CacheKeyFlags, Family, FontSystem, Metrics, Shaping, Weight, Wrap};
 
 use super::md::{Block, Nest, Span};
 use super::style::{Align, Face, Style};
@@ -36,8 +36,10 @@ const QUOTE_INDENT: f32 = 14.0;
 const CODE_PAD: f32 = 6.0;
 
 /// One shaped glyph: its id, where it starts (absolute x on the page), its
-/// advance, its offsets (em, as cosmic-text reports them), and the bytes of
-/// `GlyphRun::text` it was shaped from.
+/// advance, its offsets (em, as cosmic-text reports them), the bytes of
+/// `GlyphRun::text` it was shaped from, and where its cluster starts in its
+/// block's text (`NOT_TEXT` for a list marker or a page number, which the
+/// caret never visits).
 #[derive(Debug, Clone)]
 pub struct Glyph {
     pub id: u16,
@@ -46,7 +48,11 @@ pub struct Glyph {
     pub x_offset: f32,
     pub y_offset: f32,
     pub range: Range<usize>,
+    pub at: usize,
+    pub flags: CacheKeyFlags,
 }
+
+pub const NOT_TEXT: usize = usize::MAX;
 
 /// Glyphs of one face, size and color on one baseline.
 #[derive(Debug, Clone)]
@@ -71,7 +77,7 @@ pub enum Item {
 }
 
 impl Item {
-    fn shifted(mut self, dx: f32, dy: f32) -> Item {
+    pub fn shifted(mut self, dx: f32, dy: f32) -> Item {
         match &mut self {
             Item::Glyphs(run) => {
                 run.baseline += dy;
@@ -113,25 +119,35 @@ pub struct Laid {
 /// One row of a block: its height, and its items relative to the frame's
 /// left edge and the row's top.
 #[derive(Debug, Clone, Default)]
-struct Row {
-    height: f32,
-    items: Vec<Item>,
+pub struct Row {
+    pub height: f32,
+    pub items: Vec<Item>,
+}
+
+impl Row {
+    /// The row's text glyphs in order, as (block-text offset of the
+    /// cluster, cluster length in bytes, x, advance).
+    pub fn clusters(&self) -> impl Iterator<Item = (usize, usize, f32, f32)> + '_ {
+        self.items.iter().filter_map(|i| if let Item::Glyphs(r) = i { Some(r) } else { None }).flat_map(|r| {
+            r.glyphs.iter().filter(|g| g.at != NOT_TEXT).map(|g| (g.at, g.range.len(), g.x, g.advance))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Default)]
-struct Shaped {
-    rows: Vec<Row>,
-    space_before: f32,
-    space_after: f32,
-    keep_with_next: bool,
-    page_break: bool,
-    outline: Option<(u8, String)>,
+pub struct Shaped {
+    pub rows: Vec<Row>,
+    pub space_before: f32,
+    pub space_after: f32,
+    pub keep_with_next: bool,
+    pub page_break: bool,
+    pub outline: Option<(u8, String)>,
 }
 
-/// The faces a document uses, resolved once.
-struct Look<'a> {
-    style: &'a Style,
-    width: f32,
+/// The style and the text frame's width blocks are shaped for.
+pub struct Look<'a> {
+    pub style: &'a Style,
+    pub width: f32,
 }
 
 fn attrs<'a>(face: &'a Face, span: Option<&Span>, mono: &'a Face, meta: usize) -> Attrs<'a> {
@@ -169,8 +185,21 @@ fn shape(fs: &mut FontSystem, spans: &[Span], face: &Face, look: &Look, width: f
     }
     buffer.shape_until_scroll(fs, false);
 
+    // Where each of cosmic-text's lines (the text split at hard breaks)
+    // starts in the block's text.
+    let mut line_starts = vec![0usize];
+    let mut off = 0;
+    for s in spans {
+        for (i, c) in s.text.char_indices() {
+            if c == '\n' {
+                line_starts.push(off + i + 1);
+            }
+        }
+        off += s.text.len();
+    }
     let mut rows = Vec::new();
     for run in buffer.layout_runs() {
+        let line_start = line_starts.get(run.line_i).copied().unwrap_or(0);
         let mut row = Row { height: run.line_height, items: Vec::new() };
         let baseline = run.line_y - run.line_top;
         let text: Arc<str> = Arc::from(run.text);
@@ -203,6 +232,8 @@ fn shape(fs: &mut FontSystem, spans: &[Span], face: &Face, look: &Look, width: f
                 x_offset: g.x_offset,
                 y_offset: g.y_offset,
                 range: g.start..g.end,
+                at: line_start + g.start,
+                flags: g.cache_key_flags,
             };
             match runs.last_mut() {
                 Some(r) if r.font == g.font_id && r.size == g.font_size && r.color == c => r.glyphs.push(glyph),
@@ -237,7 +268,20 @@ fn plain(text: &str) -> Vec<Span> {
     vec![Span { text: text.to_string(), ..Default::default() }]
 }
 
-fn shape_block(fs: &mut FontSystem, block: &Block, look: &Look, base: &Path) -> Shaped {
+/// Mark every glyph of rows as not text (markers, page numbers).
+fn not_text(rows: &mut [Row]) {
+    for row in rows {
+        for item in &mut row.items {
+            if let Item::Glyphs(run) = item {
+                for g in &mut run.glyphs {
+                    g.at = NOT_TEXT;
+                }
+            }
+        }
+    }
+}
+
+pub fn shape_block(fs: &mut FontSystem, block: &Block, look: &Look, base: &Path) -> Shaped {
     let style = look.style;
     match block {
         Block::Heading { level, spans } => {
@@ -262,7 +306,8 @@ fn shape_block(fs: &mut FontSystem, block: &Block, look: &Look, base: &Path) -> 
             }
             if let (Some(marker), Some(first)) = (&nest.marker, rows.first_mut()) {
                 // The marker hangs left of the text, on its first baseline.
-                let m = shape(fs, &plain(marker), &style.body, look, LIST_INDENT * 2.0, style.leading as f32, color, Align::Left);
+                let mut m = shape(fs, &plain(marker), &style.body, look, LIST_INDENT * 2.0, style.leading as f32, color, Align::Left);
+                not_text(&mut m);
                 if let Some(Item::Glyphs(run)) = m.into_iter().next().and_then(|r| r.items.into_iter().find(|i| matches!(i, Item::Glyphs(_)))) {
                     let w: f32 = run.glyphs.iter().map(|g| g.advance).sum();
                     // First among the row's runs: drawn in reading order, so
@@ -320,7 +365,8 @@ fn shape_block(fs: &mut FontSystem, block: &Block, look: &Look, base: &Path) -> 
                 None => {
                     log::warn!("picture {}: not found or not PNG/JPEG", path.display());
                     let note = format!("[picture not found: {src}{}]", if alt.is_empty() { String::new() } else { format!(" — {alt}") });
-                    let rows = shape(fs, &plain(&note), &style.body, look, look.width, style.leading as f32, QUIET, Align::Left);
+                    let mut rows = shape(fs, &plain(&note), &style.body, look, look.width, style.leading as f32, QUIET, Align::Left);
+                    not_text(&mut rows);
                     Shaped { rows, space_after: style.space_after as f32, ..Default::default() }
                 }
             }
@@ -349,30 +395,42 @@ fn quote_bars(rows: &mut [Row], nest: &Nest) {
     }
 }
 
-/// Where each row of each block goes: its page, and its top below the
-/// frame's top, on a frame `fh` tall.
-fn paginate(blocks: &[Shaped], fh: f32) -> Vec<Vec<(usize, f32)>> {
-    let mut out = Vec::with_capacity(blocks.len());
-    let mut page = 0usize;
-    // y below the frame's top; `used` while the page has anything on it.
-    let (mut y, mut used) = (0.0f32, false);
-    let mut after = 0.0f32;
-    for (b, block) in blocks.iter().enumerate() {
-        let mut places = Vec::with_capacity(block.rows.len());
+/// Where the flow of blocks stands before a block: the page, y below the
+/// frame's top, whether the page has anything on it, and the space owed
+/// after the block before.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Flow {
+    pub page: usize,
+    pub y: f32,
+    pub used: bool,
+    pub after: f32,
+}
+
+/// Lay out blocks `from..` down pages of a frame `fh` tall, starting in
+/// state `flow`: each block's state before it (`states[b]`) and each of its
+/// rows' page and top (`places[b]`). Earlier entries are left alone, which
+/// is what lets an edit re-paginate from the block it changed: placements
+/// depend only on what came before.
+pub fn flow(blocks: &[&Shaped], fh: f32, from: usize, mut f: Flow, places: &mut Vec<Vec<(usize, f32)>>, states: &mut Vec<Flow>) {
+    places.resize(blocks.len(), Vec::new());
+    states.resize(blocks.len(), Flow::default());
+    for b in from..blocks.len() {
+        let block = blocks[b];
+        states[b] = f;
+        let mut out = Vec::with_capacity(block.rows.len());
         if block.page_break {
-            if used {
-                page += 1;
-                (y, used) = (0.0, false);
+            if f.used {
+                (f.page, f.y, f.used) = (f.page + 1, 0.0, false);
             }
-            after = 0.0;
-            out.push(places);
+            f.after = 0.0;
+            places[b] = out;
             continue;
         }
         if block.rows.is_empty() {
-            out.push(places);
+            places[b] = out;
             continue;
         }
-        let gap = if used { after.max(block.space_before) } else { 0.0 };
+        let gap = if f.used { f.after.max(block.space_before) } else { 0.0 };
         // What must fit with the block's first row: its second (no orphan),
         // and for a heading, the first two rows of what follows.
         let mut need: f32 = block.rows.iter().take(if block.keep_with_next { usize::MAX } else { 2 }).map(|r| r.height).sum();
@@ -381,71 +439,51 @@ fn paginate(blocks: &[Shaped], fh: f32) -> Vec<Vec<(usize, f32)>> {
                 need += block.space_after.max(next.space_before) + next.rows.iter().take(2).map(|r| r.height).sum::<f32>();
             }
         }
-        if used && y + gap + need > fh {
-            page += 1;
-            (y, used) = (0.0, false);
+        if f.used && f.y + gap + need > fh {
+            (f.page, f.y, f.used) = (f.page + 1, 0.0, false);
         }
-        if used {
-            y += gap;
+        if f.used {
+            f.y += gap;
         }
         let n = block.rows.len();
         for (i, row) in block.rows.iter().enumerate() {
-            let breaks = y + row.height > fh;
+            let breaks = f.y + row.height > fh;
             // Keep the last line company: if it alone would spill over,
             // take the one before it along.
-            let widow = !breaks && n >= 3 && i == n - 2 && i >= 2 && y + row.height + block.rows[n - 1].height > fh;
-            if (breaks || widow) && used {
-                page += 1;
-                y = 0.0;
+            let widow = !breaks && n >= 3 && i == n - 2 && i >= 2 && f.y + row.height + block.rows[n - 1].height > fh;
+            if (breaks || widow) && f.used {
+                (f.page, f.y) = (f.page + 1, 0.0);
             }
-            places.push((page, y));
-            y += row.height;
-            used = true;
+            out.push((f.page, f.y));
+            f.y += row.height;
+            f.used = true;
         }
-        after = block.space_after;
-        out.push(places);
+        f.after = block.space_after;
+        places[b] = out;
     }
-    out
 }
 
-/// Typeset blocks with a style. `base` is where relative picture paths
-/// start (the document's folder).
-pub fn typeset(fs: &mut FontSystem, blocks: &[Block], style: &Style, base: &Path) -> Laid {
-    let (fx, fy, fw, fh) = style.frame();
-    let (fx, fy, fw, fh) = (fx as f32, fy as f32, fw as f32, fh as f32);
+/// Where each row of each block goes, from the start.
+#[cfg(test)]
+pub fn paginate(blocks: &[Shaped], fh: f32) -> Vec<Vec<(usize, f32)>> {
+    let refs: Vec<&Shaped> = blocks.iter().collect();
+    let (mut places, mut states) = (Vec::new(), Vec::new());
+    flow(&refs, fh, 0, Flow::default(), &mut places, &mut states);
+    places
+}
+
+/// A page's number, centred in the foot margin: items in page coordinates.
+pub fn page_number(fs: &mut FontSystem, style: &Style, page: usize) -> Vec<Item> {
+    let (fx, _, fw, _) = style.frame();
+    let (fx, fw) = (fx as f32, fw as f32);
     let look = Look { style, width: fw };
-    let shaped: Vec<Shaped> = blocks.iter().map(|b| shape_block(fs, b, &look, base)).collect();
-
-    let places = paginate(&shaped, fh);
-    let count = places.iter().flatten().map(|&(p, _)| p + 1).max().unwrap_or(1);
-    let mut pages = vec![Page::default(); count];
-    let mut outline = Vec::new();
-    for (block, places) in shaped.iter().zip(&places) {
-        if let (Some((level, title)), Some(&(page, y))) = (&block.outline, places.first()) {
-            outline.push(OutlineEntry { level: *level, title: title.clone(), page, y: fy + y });
-        }
-        for (row, &(page, y)) in block.rows.iter().zip(places) {
-            pages[page].items.extend(row.items.iter().cloned().map(|item| item.shifted(fx, fy + y)));
-        }
-    }
-
-    if style.page_numbers {
-        let count = pages.len();
-        let face = Face { size: (style.body.size * 0.85).max(6.0), ..style.body.clone() };
-        for (i, page) in pages.iter_mut().enumerate() {
-            if count < 2 {
-                break;
-            }
-            let rows = shape(fs, &plain(&(i + 1).to_string()), &face, &look, fw, 1.2, QUIET, Align::Left);
-            if let Some(row) = rows.into_iter().next() {
-                let w: f32 = row.items.iter().map(|it| if let Item::Glyphs(r) = it { r.glyphs.iter().map(|g| g.advance).sum() } else { 0.0 }).sum();
-                let foot = style.page.1 as f32 - style.margins[2] as f32 / 2.0 - face.size as f32;
-                page.items.extend(row.items.into_iter().map(|it| it.shifted(fx + (fw - w) / 2.0, foot)));
-            }
-        }
-    }
-
-    Laid { size: (style.page.0 as f32, style.page.1 as f32), pages, outline }
+    let face = Face { size: (style.body.size * 0.85).max(6.0), ..style.body.clone() };
+    let mut rows = shape(fs, &plain(&(page + 1).to_string()), &face, &look, fw, 1.2, QUIET, Align::Left);
+    not_text(&mut rows);
+    let Some(row) = rows.into_iter().next() else { return Vec::new() };
+    let w: f32 = row.items.iter().map(|it| if let Item::Glyphs(r) = it { r.glyphs.iter().map(|g| g.advance).sum() } else { 0.0 }).sum();
+    let foot = style.page.1 as f32 - style.margins[2] as f32 / 2.0 - face.size as f32;
+    row.items.into_iter().map(|it| it.shifted(fx + (fw - w) / 2.0, foot)).collect()
 }
 
 #[cfg(test)]

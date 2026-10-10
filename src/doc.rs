@@ -87,6 +87,20 @@ impl Job {
     }
 }
 
+/// Whatever draws pages: PDFium, poppler, or the writing engine's painter.
+pub trait Render {
+    fn render(&self, job: Job);
+}
+
+impl Render for Backend {
+    fn render(&self, job: Job) {
+        match self {
+            Backend::Pdfium(e) => e.render(job),
+            Backend::Poppler(p) => p.render(job),
+        }
+    }
+}
+
 pub enum Backend {
     Pdfium(engine::Engine),
     Poppler(poppler::Renderer),
@@ -126,12 +140,6 @@ impl Backend {
         }
     }
 
-    fn render(&self, job: Job) {
-        match self {
-            Backend::Pdfium(e) => e.render(job),
-            Backend::Poppler(p) => p.render(job),
-        }
-    }
 }
 
 enum PageState {
@@ -191,7 +199,7 @@ impl PageStore {
     /// and returns None.
     pub fn ensure(
         &mut self,
-        backend: &Backend,
+        backend: &dyn Render,
         doc: &Document,
         quarter_turns: u8,
         page: usize,
