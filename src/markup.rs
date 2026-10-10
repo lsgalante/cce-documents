@@ -1,5 +1,6 @@
-//! What the reader adds to a PDF: the annotations on a page as the app
-//! sees them, and the edits it asks the engine to make.
+//! What the reader changes in a PDF: the annotations on a page as the app
+//! sees them, the edits it asks the engine to make to a page, and the page
+//! operations that rearrange the document.
 //!
 //! Pure data: rects are in display points (see `text`), the engine converts
 //! them to PDF page space. An annotation is addressed by its index in the
@@ -95,6 +96,40 @@ impl Edit {
     }
 }
 
+/// A change to the document's pages. Page indices are those before the
+/// operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PageOp {
+    Delete { pages: Vec<usize> },
+    /// Turn pages by quarter turns clockwise (negative: counter-clockwise),
+    /// in the file: their /Rotate.
+    Rotate { pages: Vec<usize>, quarter_turns: i32 },
+    /// Move pages, in their order, into the gap before page `gap` (0..=page
+    /// count; the count is the end).
+    Move { pages: Vec<usize>, gap: usize },
+    /// Insert every page of another PDF before page `at`.
+    Insert { from: std::path::PathBuf, at: usize },
+}
+
+impl PageOp {
+    /// Where the first moved or inserted page ends up, for the view to
+    /// follow; None when the pages are gone.
+    pub fn lands_at(&self) -> Option<usize> {
+        match self {
+            PageOp::Delete { .. } => None,
+            PageOp::Rotate { pages, .. } => pages.iter().min().copied(),
+            PageOp::Move { pages, gap } => Some(move_dest(pages, *gap)),
+            PageOp::Insert { at, .. } => Some(*at),
+        }
+    }
+}
+
+/// The index the first of `pages` has after moving them into `gap`: the gap
+/// counted without the pages being moved.
+pub fn move_dest(pages: &[usize], gap: usize) -> usize {
+    gap - pages.iter().filter(|&&p| p < gap).count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +156,15 @@ mod tests {
         let annots = [annot(0, AnnotKind::Markup(MarkupKind::Underline), 0.0, 10.0, 100.0, 11.0)];
         assert!(annot_at(&annots, 50.0, 12.5).is_some());
         assert!(annot_at(&annots, 50.0, 14.0).is_none());
+    }
+
+    #[test]
+    fn moving_pages_counts_the_gap_without_them() {
+        // Pages 1 and 2 of 0..5 dropped before page 4 land at index 2.
+        assert_eq!(move_dest(&[1, 2], 4), 2);
+        // Dropped at the front.
+        assert_eq!(move_dest(&[3], 0), 0);
+        // Dropped at the end of five pages.
+        assert_eq!(move_dest(&[0], 5), 4);
     }
 }

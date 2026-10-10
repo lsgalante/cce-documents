@@ -14,9 +14,11 @@ use std::path::{Path, PathBuf};
 
 use crate::{engine, poppler, Message};
 
-/// GPU pages kept resident. The cce-ui image registry hard-caps at 256
-/// images total, so leave generous headroom.
-const MAX_GPU_PAGES: usize = 24;
+/// GPU images kept resident across both stores (`PAGE_BUDGET` pages, plus
+/// thumbnails) must stay well under the cce-ui image registry's hard cap of
+/// 256 images.
+pub const PAGE_BUDGET: usize = 24;
+pub const THUMB_BUDGET: usize = 64;
 /// Largest bitmap edge we'll upload; bigger pages are rendered at a capped
 /// DPI.
 const MAX_DIM: u32 = 8192;
@@ -45,6 +47,8 @@ pub struct Rendered {
 }
 
 pub struct Job {
+    /// Which `PageStore` asked: the page view or the thumbnails.
+    pub slot: u8,
     pub generation: u64,
     pub doc: u64,
     pub page: usize,
@@ -136,14 +140,31 @@ enum PageState {
 /// eviction. `reset()` bumps the generation so late results from a previous
 /// document/rotation are freed on arrival instead of displayed.
 pub struct PageStore {
+    /// Carried by its jobs, so each answer finds the store that asked.
+    slot: u8,
+    /// Pages kept on the GPU.
+    budget: usize,
     states: HashMap<usize, PageState>,
     generation: u64,
     frame: u64,
 }
 
 impl PageStore {
-    pub fn new() -> Self {
-        Self { states: HashMap::new(), generation: 0, frame: 0 }
+    pub fn new(slot: u8, budget: usize) -> Self {
+        Self { slot, budget, states: HashMap::new(), generation: 0, frame: 0 }
+    }
+
+    pub fn slot(&self) -> u8 {
+        self.slot
+    }
+
+    /// The document changed under every page (an undo): render them all
+    /// again, showing the old images meanwhile.
+    pub fn invalidate_all(&mut self) {
+        let pages: Vec<usize> = self.states.keys().copied().collect();
+        for page in pages {
+            self.invalidate(page);
+        }
     }
 
     pub fn begin_frame(&mut self) {
@@ -171,6 +192,7 @@ impl PageStore {
         want_dpi: u32,
     ) -> Option<Rendered> {
         let job = |dpi| Job {
+            slot: self.slot,
             generation: self.generation,
             doc: doc.id,
             page,
@@ -237,7 +259,7 @@ impl PageStore {
     /// this frame are never evicted.
     fn evict(&mut self) {
         let resident = self.states.values().filter(|s| matches!(s, PageState::Ready { .. })).count();
-        if resident <= MAX_GPU_PAGES {
+        if resident <= self.budget {
             return;
         }
         let mut ready: Vec<(usize, u64)> = self
@@ -249,7 +271,7 @@ impl PageStore {
             })
             .collect();
         ready.sort_by_key(|&(_, used)| used);
-        for (page, _) in ready.into_iter().take(resident - MAX_GPU_PAGES) {
+        for (page, _) in ready.into_iter().take(resident - self.budget) {
             if let Some(PageState::Ready { r, .. }) = self.states.remove(&page) {
                 cce_ui::vk::free_image(r.image);
             }

@@ -17,6 +17,8 @@ const SEPARATOR: f32 = 10.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
+    /// Open or close the page sidebar.
+    Pages,
     Select,
     Draw,
     Note,
@@ -25,6 +27,11 @@ pub enum Action {
     Strike,
     Undo,
     Save,
+    // The page sidebar's own buttons.
+    Insert,
+    Extract,
+    RotatePages,
+    DeletePages,
 }
 
 pub struct Button {
@@ -41,40 +48,88 @@ pub fn width_of(fs: &mut FontSystem, text: &str, size: f32) -> f32 {
     cce_ui::engine::shaped_cluster_offsets(fs, text, size, None).last().map_or(0.0, |&(_, x)| x)
 }
 
-/// Each button's rect: a bar centred along the bottom, the root plate's
-/// inset up from the edge.
-pub fn toolbar_layout(fs: &mut FontSystem, buttons: &[Button], win: (f32, f32)) -> Vec<Rect> {
+/// Each button's rect: a bar centred along the bottom of `area`, the root
+/// plate's inset up from its edge. When the bar is wider than `area`, it
+/// wraps between groups onto rows above, each centred.
+pub fn toolbar_layout(fs: &mut FontSystem, buttons: &[Button], area: Rect) -> Vec<Rect> {
+    let inset = cce_ui::layout::root_plate_inset();
     let widths: Vec<f32> = buttons.iter().map(|b| width_of(fs, b.label, TOOLBAR_FONT) + 2.0 * BUTTON_PAD).collect();
-    let gaps = buttons.iter().skip(1).filter(|b| b.group).count() as f32 * SEPARATOR;
-    let total = widths.iter().sum::<f32>() + gaps;
-    let y = win.1 - cce_ui::layout::root_plate_inset() - TOOLBAR_H;
-    let mut x = ((win.0 - total) / 2.0).max(0.0);
-    buttons
-        .iter()
-        .zip(widths)
-        .enumerate()
-        .map(|(i, (b, w))| {
-            if i > 0 && b.group {
+    // Groups: runs of buttons, each starting where `group` is set.
+    let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, b) in buttons.iter().enumerate() {
+        match groups.last_mut() {
+            Some(g) if !b.group => g.end = i + 1,
+            _ => groups.push(i..i + 1),
+        }
+    }
+    let avail = (area.width - 2.0 * inset).max(0.0);
+    let group_w = |g: &std::ops::Range<usize>| widths[g.clone()].iter().sum::<f32>();
+    let mut rows: Vec<Vec<std::ops::Range<usize>>> = vec![Vec::new()];
+    let mut row_w = 0.0;
+    for g in groups {
+        let w = group_w(&g);
+        let row = rows.last_mut().expect("never empty");
+        if !row.is_empty() && row_w + SEPARATOR + w > avail {
+            rows.push(vec![g]);
+            row_w = w;
+        } else {
+            row_w += if row.is_empty() { w } else { SEPARATOR + w };
+            row.push(g);
+        }
+    }
+    let mut rects = vec![Rect { x: 0.0, y: 0.0, width: 0.0, height: 0.0 }; buttons.len()];
+    let bottom = area.y + area.height - inset - TOOLBAR_H;
+    let n = rows.len();
+    for (r, row) in rows.iter().enumerate() {
+        let total = row.iter().map(&group_w).sum::<f32>() + SEPARATOR * row.len().saturating_sub(1) as f32;
+        let y = bottom - (n - 1 - r) as f32 * (TOOLBAR_H + 12.0);
+        let mut x = area.x + ((area.width - total) / 2.0).max(0.0);
+        for (k, g) in row.iter().enumerate() {
+            if k > 0 {
                 x += SEPARATOR;
             }
-            let r = Rect { x, y, width: w, height: TOOLBAR_H };
-            x += w;
-            r
-        })
-        .collect()
+            for i in g.clone() {
+                rects[i] = Rect { x, y, width: widths[i], height: TOOLBAR_H };
+                x += widths[i];
+            }
+        }
+    }
+    rects
 }
 
+/// The bar behind each row of the toolbar, then its buttons.
 pub fn paint_toolbar(pc: &mut PaintCtx, buttons: &[Button], rects: &[Rect]) {
-    let (Some(first), Some(last)) = (rects.first(), rects.last()) else { return };
-    let bar = Rect { x: first.x - 4.0, y: first.y - 4.0, width: last.x + last.width - first.x + 8.0, height: TOOLBAR_H + 8.0 };
-    pc.rounded_rect(bar, 8.0, (true, true, true, true), [0.0, 0.0, 0.0, 0.62]);
+    let mut rows: Vec<(f32, f32, f32)> = Vec::new(); // y, left, right
+    for r in rects {
+        match rows.iter_mut().find(|row| row.0 == r.y) {
+            Some(row) => {
+                row.1 = row.1.min(r.x);
+                row.2 = row.2.max(r.x + r.width);
+            }
+            None => rows.push((r.y, r.x, r.x + r.width)),
+        }
+    }
+    for (y, l, rr) in rows {
+        let bar = Rect { x: l - 4.0, y: y - 4.0, width: rr - l + 8.0, height: TOOLBAR_H + 8.0 };
+        pc.rounded_rect(bar, 8.0, (true, true, true, true), [0.0, 0.0, 0.0, 0.62]);
+    }
+    paint_buttons(pc, buttons, rects, TOOLBAR_FONT, false);
+}
+
+/// Buttons alone, without the bar (or each on a faint plate of its own,
+/// `framed`): labels at the padding, the `on` one lit, disabled ones
+/// dimmed.
+pub fn paint_buttons(pc: &mut PaintCtx, buttons: &[Button], rects: &[Rect], size: f32, framed: bool) {
     for (b, r) in buttons.iter().zip(rects) {
+        if framed {
+            pc.rounded_rect(*r, 6.0, (true, true, true, true), [1.0, 1.0, 1.0, if b.enabled { 0.10 } else { 0.04 }]);
+        }
         if b.on {
             pc.rounded_rect(*r, 6.0, (true, true, true, true), [1.0, 1.0, 1.0, 0.18]);
         }
-        let ty = cce_ui::layout::align_text_y(r.y, r.height, TOOLBAR_FONT, 0.0);
+        let ty = cce_ui::layout::align_text_y(r.y, r.height, size, 0.0);
         let color = if b.enabled { [235, 235, 235] } else { [120, 120, 120] };
-        pc.text(b.label.to_string(), r.x + BUTTON_PAD, ty, TOOLBAR_FONT, color);
+        pc.text(b.label.to_string(), r.x + BUTTON_PAD, ty, size, color);
     }
 }
 

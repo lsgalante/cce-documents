@@ -16,8 +16,15 @@
 //! press h / u / s to highlight, underline or strike it; d draws in ink, n
 //! places a note, v is back to selecting; click a form field to fill it, a
 //! note to edit it, any other mark to pick it (Delete removes it); Ctrl+Z
-//! takes back the last mark; Ctrl+S saves, Ctrl+Shift+S saves as. The
-//! toolbar along the bottom does the same.
+//! takes back the last change of any kind, Ctrl+Shift+Z puts it back;
+//! Ctrl+S saves, Ctrl+Shift+S saves as. The toolbar along the bottom does
+//! the same.
+//!
+//! t opens the page sidebar: thumbnails to click through and select (Shift
+//! for a range, Ctrl to add one), drag to reorder; with pages selected,
+//! Delete removes them and r / l turn them in the file. Its buttons insert
+//! another PDF's pages (after the selection, or at the end: a merge), save
+//! the selection as a PDF of its own, turn and delete.
 //!
 //! Keys: o open · +/- zoom · 0 fit · 1 actual size · r/l rotate ·
 //! arrows/PageUp/PageDown/Home/End pages · Ctrl+F find · Enter/F3 next match
@@ -45,9 +52,11 @@ use cce_ui::widget::line_edit::EditOutcome;
 use cce_ui::widget::scroll_motion::{Bounds, ScrollMotion};
 use cce_ui::widget::{ElementState, Key, KeyEvent, LineEdit, MouseButton, MouseScrollDelta, NamedKey, Position};
 
+use std::collections::BTreeSet;
+
 use chrome::{Action, Button, FieldLook};
-use doc::{Backend, Document, PageStore, Rendered};
-use markup::{annot_at, Annot, AnnotKind, Edit, FieldKind, MarkupKind};
+use doc::{Backend, Document, PageStore, Rendered, PAGE_BUDGET, THUMB_BUDGET};
+use markup::{annot_at, move_dest, Annot, AnnotKind, Edit, FieldKind, MarkupKind, PageOp};
 use text::{Mark, PageText, PtRect, Selection};
 
 /// Vertical gap between pages, in document units (so the layout scales
@@ -79,16 +88,29 @@ const INK: [f32; 4] = [200.0 / 255.0, 30.0 / 255.0, 60.0 / 255.0, 1.0];
 /// A pen stroke's width, in points.
 const INK_PT: f64 = 2.0;
 const NOTE_EDITOR_W: f32 = 280.0;
+/// The page sidebar: its width, a thumbnail's width, the room between
+/// thumbnails (the page number sits in it), and the button rows above.
+const SIDEBAR_W: f32 = 176.0;
+const THUMB_W: f64 = 120.0;
+const THUMB_GAP: f64 = 26.0;
+const SIDEBAR_HEADER: f32 = 76.0;
+/// How far a press on a thumbnail moves before it is a drag.
+const DRAG_START: f64 = 6.0;
 const NOTE_EDITOR_H: f32 = 30.0;
 
 #[derive(Debug, Clone)]
 enum Message {
-    Page { generation: u64, page: usize, result: Option<Rendered> },
+    /// `slot`: which `PageStore` asked (the page view or the thumbnails).
+    Page { slot: u8, generation: u64, page: usize, result: Option<Rendered> },
     Text { doc: u64, page: usize, text: Arc<PageText> },
     Hits { generation: u64, page: usize, hits: Vec<Vec<PtRect>> },
     SearchDone { generation: u64 },
     Annots { doc: u64, page: usize, annots: Arc<Vec<markup::Annot>> },
-    Edited { doc: u64, page: usize, ok: bool },
+    /// A page's content changed. `dirty`: changes the file does not have.
+    Edited { doc: u64, page: usize, ok: bool, dirty: bool },
+    /// Anything may have changed: pages rearranged, or a step undone or
+    /// redone. `focus`: a page for the view to go to.
+    Restructured { doc: u64, sizes: Vec<doc::PageSize>, dirty: bool, focus: Option<usize>, ok: bool },
     Quit,
 }
 
@@ -132,9 +154,31 @@ struct Find {
     done: bool,
 }
 
+/// A press on a thumbnail that may become a drag.
+struct ThumbPress {
+    page: usize,
+    y: f64,
+    dragging: bool,
+    /// No Shift or Ctrl: released without a drag, it selects just its page.
+    plain: bool,
+}
+
 struct DocumentsApp {
     backend: Backend,
     store: PageStore,
+    /// Thumbnails, in their own store and budget.
+    thumbs: PageStore,
+    sidebar: bool,
+    /// The sidebar's own scroll, in px.
+    thumb_scroll: f64,
+    /// Pages selected in the sidebar, and where a Shift range starts.
+    thumb_sel: BTreeSet<usize>,
+    thumb_anchor: Option<usize>,
+    thumb_press: Option<ThumbPress>,
+    /// While dragging thumbnails: the gap they would drop into.
+    drop_gap: Option<usize>,
+    /// The last page operation sent, to select its result.
+    last_page_op: Option<PageOp>,
     doc: Option<Document>,
     next_doc: u64,
     error: Option<String>,
@@ -242,11 +286,25 @@ impl DocumentsApp {
         (rects, content_w, y - GAP_UNITS)
     }
 
+    /// Where the pages are shown: the window right of the sidebar, if it
+    /// is open. Its left edge and width, in px.
+    fn view_x(&self) -> f64 {
+        if self.sidebar { SIDEBAR_W as f64 } else { 0.0 }
+    }
+
+    fn view_w(&self) -> f64 {
+        (self.win.0 as f64 - self.view_x()).max(64.0)
+    }
+
+    fn view_rect(&self) -> Rect {
+        Rect { x: self.view_x() as f32, y: 0.0, width: self.view_w() as f32, height: self.win.1 }
+    }
+
     /// Top-left of the content in screen coords: centered when it fits,
     /// scrolled when it doesn't.
     fn origin(&self, content_w: f64, content_h: f64) -> (f64, f64) {
-        let (w, h) = (self.win.0 as f64, self.win.1 as f64);
-        let ox = ((w - content_w * self.zoom) / 2.0).max(0.0) - self.scroll.0;
+        let (w, h) = (self.view_w(), self.win.1 as f64);
+        let ox = self.view_x() + ((w - content_w * self.zoom) / 2.0).max(0.0) - self.scroll.0;
         let oy = ((h - content_h * self.zoom) / 2.0).max(0.0) - self.scroll.1;
         (ox, oy)
     }
@@ -267,6 +325,9 @@ impl DocumentsApp {
     /// page (a selection drag keeps extending across the gaps).
     fn page_at(&self, px: f64, py: f64, nearest: bool) -> Option<(usize, f64, f64)> {
         let doc = self.doc.as_ref()?;
+        if px < self.view_x() {
+            return None;
+        }
         let (rects, cw, ch) = self.layout();
         let (ox, oy) = self.origin(cw, ch);
         let (dx, dy) = ((px - ox) / self.zoom, (py - oy) / self.zoom);
@@ -287,7 +348,7 @@ impl DocumentsApp {
 
     fn clamp_scroll(&mut self) {
         let (_, cw, ch) = self.layout();
-        let (w, h) = (self.win.0 as f64, self.win.1 as f64);
+        let (w, h) = (self.view_w(), self.win.1 as f64);
         self.scroll.0 = self.scroll.0.clamp(0.0, (cw * self.zoom - w).max(0.0));
         self.scroll.1 = self.scroll.1.clamp(0.0, (ch * self.zoom - h).max(0.0));
     }
@@ -301,7 +362,7 @@ impl DocumentsApp {
     /// The wheel's range per axis, `0..=overflow` — what `clamp_scroll` clamps to.
     fn scroll_bounds(&self) -> (Bounds, Bounds) {
         let (_, cw, ch) = self.layout();
-        let (w, h) = (self.win.0 as f64, self.win.1 as f64);
+        let (w, h) = (self.view_w(), self.win.1 as f64);
         (Bounds::max((cw * self.zoom - w) as f32), Bounds::max((ch * self.zoom - h) as f32))
     }
 
@@ -331,10 +392,10 @@ impl DocumentsApp {
         let (dx, dy) = ((px - ox) / self.zoom, (py - oy) / self.zoom);
         self.zoom = (self.zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
         self.fit = false;
-        let (w, h) = (self.win.0 as f64, self.win.1 as f64);
+        let (w, h) = (self.view_w(), self.win.1 as f64);
         let pad_x = ((w - cw * self.zoom) / 2.0).max(0.0);
         let pad_y = ((h - ch * self.zoom) / 2.0).max(0.0);
-        self.scroll.0 = pad_x - (px - dx * self.zoom);
+        self.scroll.0 = self.view_x() + pad_x - (px - dx * self.zoom);
         self.scroll.1 = pad_y - (py - dy * self.zoom);
         self.clamp_scroll();
     }
@@ -354,7 +415,7 @@ impl DocumentsApp {
     fn fit_page(&mut self, page: usize) {
         let (rects, _, _) = self.layout();
         let Some(r) = rects.get(page) else { return };
-        let (w, h) = ((self.win.0 as f64 - fit_margin()).max(64.0), (self.win.1 as f64 - fit_margin()).max(64.0));
+        let (w, h) = ((self.view_w() - fit_margin()).max(64.0), (self.win.1 as f64 - fit_margin()).max(64.0));
         self.zoom = (w / r.w).min(h / r.h).clamp(ZOOM_MIN, ZOOM_MAX);
         self.fit = true;
         self.scroll = (0.0, r.y * self.zoom);
@@ -374,18 +435,23 @@ impl DocumentsApp {
         let (rects, cw, ch) = self.layout();
         let origin = self.origin(cw, ch);
         let s = self.screen_rect(&rects, origin, page, r);
-        let (w, h) = (self.win.0, self.win.1);
+        let (x0, w, h) = (self.view_x() as f32, self.view_w() as f32, self.win.1);
         if s.y < 0.0 || s.y + s.height > h {
             self.scroll.1 += (s.y - h / 3.0) as f64;
         }
-        if s.x < 0.0 || s.x + s.width > w {
-            self.scroll.0 += (s.x + s.width / 2.0 - w / 2.0) as f64;
+        if s.x < x0 || s.x + s.width > x0 + w {
+            self.scroll.0 += (s.x + s.width / 2.0 - (x0 + w / 2.0)) as f64;
         }
         self.clamp_scroll();
     }
 
     fn open(&mut self, path: &Path) {
         self.store.reset();
+        self.thumbs.reset();
+        self.thumb_sel.clear();
+        self.thumb_anchor = None;
+        self.thumb_scroll = 0.0;
+        self.last_page_op = None;
         self.quarter_turns = 0;
         self.error = None;
         self.texts.clear();
@@ -619,10 +685,318 @@ impl DocumentsApp {
     }
 
     fn undo(&mut self) {
+        self.commit_editor();
         if let (Some(e), Some(doc)) = (self.backend.engine(), &self.doc) {
             e.undo(doc.id);
         }
     }
+
+    fn redo(&mut self) {
+        self.commit_editor();
+        if let (Some(e), Some(doc)) = (self.backend.engine(), &self.doc) {
+            e.redo(doc.id);
+        }
+    }
+
+    /// Send a page operation; `restructured` takes in its result.
+    fn page_op(&mut self, op: PageOp) {
+        self.commit_editor();
+        if let (Some(e), Some(doc)) = (self.backend.engine(), &self.doc) {
+            e.pages(doc.id, op.clone());
+            self.last_page_op = Some(op);
+        }
+    }
+
+    /// Take in a document whose pages may all have changed: new sizes, and
+    /// every cache kept by page index is stale.
+    fn restructured(&mut self, sizes: Vec<doc::PageSize>, dirty: bool, focus: Option<usize>, ok: bool) {
+        let Some(d) = &mut self.doc else { return };
+        let old_len = d.pages.len();
+        // The same sizes (an undone mark, pages of one size reordered): keep
+        // showing the old images until the new ones land.
+        let same = d.pages == sizes;
+        d.pages = sizes;
+        let len = d.pages.len();
+        self.dirty = dirty;
+        if same {
+            self.store.invalidate_all();
+            self.thumbs.invalidate_all();
+        } else {
+            self.store.reset();
+            self.thumbs.reset();
+        }
+        self.texts.clear();
+        self.texts_asked.clear();
+        self.annots.clear();
+        self.annots_asked.clear();
+        self.selection = None;
+        self.picked = None;
+        self.stroke = None;
+        self.cancel_editor();
+        if !ok {
+            self.status = Some("That change could not be made".to_string());
+        }
+        // Select what the operation made.
+        self.thumb_sel = match self.last_page_op.take() {
+            Some(PageOp::Move { pages, gap }) if ok => {
+                let d = move_dest(&pages, gap);
+                (d..d + pages.len()).collect()
+            }
+            Some(PageOp::Insert { at, .. }) if ok => (at..at + len.saturating_sub(old_len)).collect(),
+            Some(PageOp::Rotate { pages, .. }) => pages.into_iter().collect(),
+            _ => BTreeSet::new(),
+        };
+        self.thumb_sel.retain(|&p| p < len);
+        self.thumb_anchor = self.thumb_sel.first().copied();
+        self.restart_search();
+        match focus.filter(|&f| f < len) {
+            Some(f) if self.fit => self.fit_page(f),
+            Some(f) => self.go_to_page(f),
+            None if self.fit => self.fit_page(self.current_page()),
+            None => self.clamp_scroll(),
+        }
+        if let Some(f) = focus {
+            self.reveal_thumb(f.min(len.saturating_sub(1)));
+        }
+        self.clamp_thumb_scroll();
+    }
+
+    fn toggle_sidebar(&mut self) {
+        if self.backend.engine().is_none() || self.doc.is_none() {
+            return;
+        }
+        let page = self.current_page();
+        self.sidebar = !self.sidebar;
+        if self.fit {
+            self.fit_page(page);
+        } else {
+            self.clamp_scroll();
+        }
+        if self.sidebar {
+            self.reveal_thumb(page);
+        }
+    }
+
+    fn insert_pdf(&mut self) {
+        let Some(path) = cce_ui::file_dialog::pick_file("Insert pages from", &[("PDF", &["pdf"])]) else { return };
+        let end = self.doc.as_ref().map_or(0, |d| d.pages.len());
+        let at = self.thumb_sel.last().map_or(end, |&p| p + 1);
+        self.page_op(PageOp::Insert { from: path, at });
+    }
+
+    fn extract_pages(&mut self) {
+        let pages: Vec<usize> = self.thumb_sel.iter().copied().collect();
+        if pages.is_empty() {
+            return;
+        }
+        let target = match cce_ui::file_dialog::save_file("Save pages as", &[("PDF", &["pdf"])]) {
+            Some(p) if p.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) => p,
+            Some(p) => p.with_extension("pdf"),
+            None => return,
+        };
+        let (Some(e), Some(doc)) = (self.backend.engine(), &self.doc) else { return };
+        let n = pages.len();
+        self.status = Some(match e.extract(doc.id, pages, &target) {
+            Ok(()) => {
+                let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+                format!("Saved {n} page{} to {name}", if n == 1 { "" } else { "s" })
+            }
+            Err(err) => format!("Not saved: {err}"),
+        });
+    }
+
+    fn rotate_pages(&mut self, quarter_turns: i32) {
+        let pages: Vec<usize> = self.thumb_sel.iter().copied().collect();
+        if !pages.is_empty() {
+            self.page_op(PageOp::Rotate { pages, quarter_turns });
+        }
+    }
+
+    fn delete_pages(&mut self) {
+        let pages: Vec<usize> = self.thumb_sel.iter().copied().collect();
+        let len = self.doc.as_ref().map_or(0, |d| d.pages.len());
+        if pages.is_empty() {
+            return;
+        }
+        if pages.len() >= len {
+            self.status = Some("A document keeps at least one page".to_string());
+            return;
+        }
+        self.page_op(PageOp::Delete { pages });
+    }
+
+    /// A thumbnail's size for a page: `THUMB_W` wide, unless the page is so
+    /// tall that 1.5 × that height caps it.
+    fn thumb_size(page: doc::PageSize) -> (f64, f64) {
+        let s = (THUMB_W / page.w.max(1.0)).min(THUMB_W * 1.5 / page.h.max(1.0));
+        (page.w * s, page.h * s)
+    }
+
+    /// Each thumbnail's rect on screen, scrolled.
+    fn thumb_rects(&self) -> Vec<Rect> {
+        let Some(doc) = &self.doc else { return Vec::new() };
+        let mut y = SIDEBAR_HEADER as f64 + 14.0 - self.thumb_scroll;
+        doc.pages
+            .iter()
+            .map(|p| {
+                let (w, h) = Self::thumb_size(*p);
+                let r = Rect { x: ((SIDEBAR_W as f64 - w) / 2.0) as f32, y: y as f32, width: w as f32, height: h as f32 };
+                y += h + THUMB_GAP;
+                r
+            })
+            .collect()
+    }
+
+    fn clamp_thumb_scroll(&mut self) {
+        let content: f64 = self.doc.as_ref().map_or(0.0, |d| d.pages.iter().map(|p| Self::thumb_size(*p).1 + THUMB_GAP).sum::<f64>() + 14.0);
+        let room = self.win.1 as f64 - SIDEBAR_HEADER as f64;
+        self.thumb_scroll = self.thumb_scroll.clamp(0.0, (content - room).max(0.0));
+    }
+
+    /// Scroll the sidebar so a page's thumbnail is in view.
+    fn reveal_thumb(&mut self, page: usize) {
+        let Some(r) = self.thumb_rects().get(page).copied() else { return };
+        let top = SIDEBAR_HEADER + 8.0;
+        let bottom = self.win.1 - 8.0;
+        if r.y < top {
+            self.thumb_scroll -= (top - r.y) as f64;
+        } else if r.y + r.height + THUMB_GAP as f32 > bottom {
+            self.thumb_scroll += (r.y + r.height + THUMB_GAP as f32 - bottom) as f64;
+        }
+        self.clamp_thumb_scroll();
+    }
+
+    /// The thumbnail under a point, counting the gap below it (its number).
+    fn thumb_at(&self, x: f64, y: f64) -> Option<usize> {
+        let x = x as f32;
+        self.thumb_rects()
+            .iter()
+            .position(|r| x >= r.x - 8.0 && x <= r.x + r.width + 8.0 && y as f32 >= r.y - 4.0 && (y as f32) <= r.y + r.height + THUMB_GAP as f32 - 4.0)
+    }
+
+    /// The gap a dragged thumbnail would drop into: before the first
+    /// thumbnail whose middle is below the point.
+    fn gap_at(&self, y: f64) -> usize {
+        let rects = self.thumb_rects();
+        rects.iter().position(|r| (y as f32) < r.y + r.height / 2.0).unwrap_or(rects.len())
+    }
+
+    fn sidebar_buttons(&self) -> (Vec<Button>, Vec<Rect>) {
+        let len = self.doc.as_ref().map_or(0, |d| d.pages.len());
+        let some = !self.thumb_sel.is_empty();
+        let b = |label, action, enabled| Button { label, action, on: false, enabled, group: false };
+        let buttons = vec![
+            b("Insert…", Action::Insert, true),
+            b("Extract…", Action::Extract, some),
+            b("Rotate", Action::RotatePages, some),
+            b("Delete", Action::DeletePages, some && self.thumb_sel.len() < len),
+        ];
+        let w = (SIDEBAR_W - 24.0) / 2.0;
+        let rects = (0..4)
+            .map(|i| Rect { x: 8.0 + (i % 2) as f32 * (w + 8.0), y: 8.0 + (i / 2) as f32 * 34.0, width: w, height: 28.0 })
+            .collect();
+        (buttons, rects)
+    }
+
+    fn sidebar_press(&mut self, x: f64, y: f64) {
+        self.commit_editor();
+        if (y as f32) < SIDEBAR_HEADER {
+            let (buttons, rects) = self.sidebar_buttons();
+            if let Some(action) = chrome::button_at(&buttons, &rects, x as f32, y as f32) {
+                self.run_action(action);
+            }
+            return;
+        }
+        let Some(i) = self.thumb_at(x, y) else {
+            self.thumb_sel.clear();
+            self.thumb_anchor = None;
+            return;
+        };
+        let plain = !self.ctrl && !self.shift;
+        if self.ctrl {
+            if !self.thumb_sel.remove(&i) {
+                self.thumb_sel.insert(i);
+            }
+            self.thumb_anchor = Some(i);
+        } else if self.shift {
+            let a = self.thumb_anchor.unwrap_or(i);
+            self.thumb_sel = (a.min(i)..=a.max(i)).collect();
+        } else if !self.thumb_sel.contains(&i) {
+            // A press on a selected page keeps the selection, so it can be
+            // dragged as a whole; the release narrows it if there was no drag.
+            self.thumb_sel = BTreeSet::from([i]);
+            self.thumb_anchor = Some(i);
+        }
+        if self.fit {
+            self.fit_page(i);
+        } else {
+            self.go_to_page(i);
+        }
+        self.thumb_press = Some(ThumbPress { page: i, y, dragging: false, plain });
+    }
+
+    fn sidebar_release(&mut self, press: ThumbPress) {
+        let gap = self.drop_gap.take();
+        if !press.dragging {
+            if press.plain {
+                self.thumb_sel = BTreeSet::from([press.page]);
+                self.thumb_anchor = Some(press.page);
+            }
+            return;
+        }
+        let Some(gap) = gap else { return };
+        let pages: Vec<usize> = self.thumb_sel.iter().copied().collect();
+        let (Some(&first), Some(&last)) = (pages.first(), pages.last()) else { return };
+        // Dropped back where it was: a contiguous run into a gap at or
+        // inside its own edges.
+        let contiguous = last - first + 1 == pages.len();
+        if contiguous && gap >= first && gap <= last + 1 {
+            return;
+        }
+        self.page_op(PageOp::Move { pages, gap });
+    }
+
+    fn paint_sidebar(&mut self, pc: &mut PaintCtx, scale: f64) {
+        let h = self.win.1;
+        pc.quad(Rect { x: 0.0, y: 0.0, width: SIDEBAR_W, height: h }, [0.105, 0.105, 0.115, 1.0]);
+        pc.quad(Rect { x: SIDEBAR_W - 1.0, y: 0.0, width: 1.0, height: h }, [1.0, 1.0, 1.0, 0.08]);
+        let rects = self.thumb_rects();
+        let current = self.current_page();
+        let list = Rect { x: 0.0, y: SIDEBAR_HEADER, width: SIDEBAR_W - 1.0, height: (h - SIDEBAR_HEADER).max(0.0) };
+        let Some(doc) = self.doc.take() else { return };
+        pc.push_clip(list);
+        for (i, r) in rects.iter().enumerate() {
+            if r.y > h || r.y + r.height + (THUMB_GAP as f32) < SIDEBAR_HEADER {
+                continue;
+            }
+            if self.thumb_sel.contains(&i) {
+                pc.rounded_rect(Rect { x: r.x - 6.0, y: r.y - 6.0, width: r.width + 12.0, height: r.height + 24.0 }, 6.0, (true, true, true, true), [0.25, 0.5, 1.0, 0.35]);
+            }
+            pc.quad(Rect { x: r.x - 1.0, y: r.y - 1.0, width: r.width + 2.0, height: r.height + 2.0 }, if i == current { [1.0, 1.0, 1.0, 0.85] } else { [0.0, 0.0, 0.0, 0.5] });
+            pc.quad(*r, [0.97, 0.97, 0.97, 1.0]);
+            let want = r.width as f64 * scale * 72.0 / doc.pages[i].w.max(1.0);
+            let dpi = *DPI_BUCKETS.iter().find(|&&b| want <= b as f64 * 1.01).unwrap_or(DPI_BUCKETS.last().unwrap());
+            if let Some(img) = self.thumbs.ensure(&self.backend, &doc, 0, i, dpi) {
+                pc.image(img.image, *r, 1.0);
+            }
+            let label = (i + 1).to_string();
+            let fs = self.font_system.get_or_insert_with(cce_ui::create_font_system);
+            let lw = chrome::width_of(fs, &label, 11.0);
+            pc.text(label, (SIDEBAR_W - lw) / 2.0, r.y + r.height + 5.0, 11.0, [190, 190, 190]);
+        }
+        if let Some(gap) = self.drop_gap {
+            let y = match rects.get(gap) {
+                Some(r) => r.y - (THUMB_GAP as f32) / 2.0 + 2.0,
+                None => rects.last().map_or(SIDEBAR_HEADER + 10.0, |r| r.y + r.height + THUMB_GAP as f32 / 2.0 + 2.0),
+            };
+            pc.quad(Rect { x: 12.0, y: y - 1.5, width: SIDEBAR_W - 24.0, height: 3.0 }, PICKED);
+        }
+        pc.pop_clip();
+        self.doc = Some(doc);
+        let (buttons, brects) = self.sidebar_buttons();
+        chrome::paint_buttons(pc, &buttons, &brects, 12.0, true);
+    }
+
 
     /// Save over the file (or, choosing, to a new one): the original bytes
     /// plus an incremental update.
@@ -664,6 +1038,11 @@ impl DocumentsApp {
             Action::Strike => self.mark_selection(MarkupKind::StrikeOut),
             Action::Undo => self.undo(),
             Action::Save => self.save(false),
+            Action::Pages => self.toggle_sidebar(),
+            Action::Insert => self.insert_pdf(),
+            Action::Extract => self.extract_pages(),
+            Action::RotatePages => self.rotate_pages(1),
+            Action::DeletePages => self.delete_pages(),
         }
     }
 
@@ -676,7 +1055,8 @@ impl DocumentsApp {
         let has_sel = self.selection.is_some_and(|s| !s.is_empty());
         let b = |label, action, on, enabled, group| Button { label, action, on, enabled, group };
         let buttons = vec![
-            b("Select", Action::Select, self.tool == Tool::Select, true, false),
+            b("Pages", Action::Pages, self.sidebar, true, false),
+            b("Select", Action::Select, self.tool == Tool::Select, true, true),
             b("Draw", Action::Draw, self.tool == Tool::Draw, true, false),
             b("Note", Action::Note, self.tool == Tool::Note, true, false),
             b("Highlight", Action::Highlight, false, has_sel, true),
@@ -685,8 +1065,9 @@ impl DocumentsApp {
             b("Undo", Action::Undo, false, true, true),
             b("Save", Action::Save, self.dirty, true, false),
         ];
+        let area = self.view_rect();
         let fs = self.font_system.get_or_insert_with(cce_ui::create_font_system);
-        let rects = chrome::toolbar_layout(fs, &buttons, self.win);
+        let rects = chrome::toolbar_layout(fs, &buttons, area);
         Some((buttons, rects))
     }
 
@@ -879,7 +1260,15 @@ impl Application for DocumentsApp {
         let sender: calloop::channel::Sender<Self::Message> = sender.into();
         let mut app = Self {
             backend: Backend::start(sender),
-            store: PageStore::new(),
+            store: PageStore::new(0, PAGE_BUDGET),
+            thumbs: PageStore::new(1, THUMB_BUDGET),
+            sidebar: false,
+            thumb_scroll: 0.0,
+            thumb_sel: BTreeSet::new(),
+            thumb_anchor: None,
+            thumb_press: None,
+            drop_gap: None,
+            last_page_op: None,
             doc: None,
             next_doc: 0,
             error: None,
@@ -943,8 +1332,12 @@ impl Application for DocumentsApp {
 
     fn update(&mut self, msg: Self::Message, needs_rebuild: &mut bool, exit: &mut bool) {
         match msg {
-            Message::Page { generation, page, result } => {
-                self.store.complete(generation, page, result);
+            Message::Page { slot, generation, page, result } => {
+                if slot == self.thumbs.slot() {
+                    self.thumbs.complete(generation, page, result);
+                } else {
+                    self.store.complete(generation, page, result);
+                }
                 *needs_rebuild = true;
             }
             Message::Text { doc, page, text } => {
@@ -974,14 +1367,21 @@ impl Application for DocumentsApp {
                     *needs_rebuild = true;
                 }
             }
-            Message::Edited { doc, page, ok } => {
+            Message::Edited { doc, page, ok, dirty } => {
                 if self.doc.as_ref().is_some_and(|d| d.id == doc) {
+                    self.dirty = dirty;
                     if ok {
                         self.store.invalidate(page);
-                        self.dirty = true;
+                        self.thumbs.invalidate(page);
                     } else {
                         self.status = Some("That change could not be made".to_string());
                     }
+                    *needs_rebuild = true;
+                }
+            }
+            Message::Restructured { doc, sizes, dirty, focus, ok } => {
+                if self.doc.as_ref().is_some_and(|d| d.id == doc) {
+                    self.restructured(sizes, dirty, focus, ok);
                     *needs_rebuild = true;
                 }
             }
@@ -1033,6 +1433,24 @@ impl Application for DocumentsApp {
 
     fn handle_pointer_move(&mut self, pos: LogicalPosition, needs_rebuild: &mut bool) {
         let (px, py) = (pos.x as f64, pos.y as f64);
+        if let Some(press) = &mut self.thumb_press {
+            if !press.dragging && (py - press.y).abs() > DRAG_START {
+                press.dragging = true;
+            }
+            if press.dragging {
+                // Near the sidebar's top or bottom edge, it scrolls along.
+                if py < SIDEBAR_HEADER as f64 + 24.0 {
+                    self.thumb_scroll -= 12.0;
+                } else if py > self.win.1 as f64 - 24.0 {
+                    self.thumb_scroll += 12.0;
+                }
+                self.clamp_thumb_scroll();
+                self.drop_gap = Some(self.gap_at(py));
+                *needs_rebuild = true;
+            }
+            self.pointer = (px, py);
+            return;
+        }
         if let Some((page, _)) = &self.stroke {
             let page = *page;
             if let (Some(p), Some((_, pts))) = (self.point_on_page(page, px, py), self.stroke.as_mut()) {
@@ -1100,6 +1518,10 @@ impl Application for DocumentsApp {
                         return None;
                     }
                 }
+                if self.sidebar && pos.x < SIDEBAR_W && !(self.find.is_some() && inside(self.find_rect())) {
+                    self.sidebar_press(px, py);
+                    return None;
+                }
                 // The find bar takes the keyboard when clicked; the page
                 // takes it back.
                 let in_find = self.find.is_some() && inside(self.find_rect());
@@ -1162,6 +1584,11 @@ impl Application for DocumentsApp {
                 *needs_rebuild = true;
             }
             ElementState::Released => {
+                if let Some(press) = self.thumb_press.take() {
+                    self.sidebar_release(press);
+                    *needs_rebuild = true;
+                    return None;
+                }
                 if let Some((page, points)) = self.stroke.take() {
                     if points.len() >= 2 {
                         self.edit(Edit::Ink { page, points, width: INK_PT });
@@ -1183,6 +1610,14 @@ impl Application for DocumentsApp {
     }
 
     fn handle_mouse_wheel(&mut self, delta: &MouseScrollDelta, pos: LogicalPosition, needs_rebuild: &mut bool) {
+        if self.sidebar && pos.x < SIDEBAR_W {
+            let line = WHEEL_SCROLL_PX as f32;
+            let (_, dy) = ScrollMotion::delta_px(delta, (line, line));
+            self.thumb_scroll += dy as f64;
+            self.clamp_thumb_scroll();
+            *needs_rebuild = true;
+            return;
+        }
         if self.ctrl {
             // Zoom stays instant: a notch (or 60px of finger) is one 1.1 step.
             let (_, ny) = Self::notches(delta);
@@ -1302,6 +1737,8 @@ impl Application for DocumentsApp {
                 self.step_match(!event.shift);
             } else if chord("s") {
                 self.save(event.shift);
+            } else if chord("z") && event.shift || chord("y") {
+                self.redo();
             } else if chord("z") {
                 self.undo();
             } else {
@@ -1313,7 +1750,7 @@ impl Application for DocumentsApp {
             return None;
         }
 
-        let (cx, cy) = (self.win.0 as f64 / 2.0, self.win.1 as f64 / 2.0);
+        let (cx, cy) = (self.view_x() + self.view_w() / 2.0, self.win.1 as f64 / 2.0);
         let pages = self.doc.as_ref().map_or(0, |d| d.pages.len());
         let mut handled = true;
         match &event.logical_key {
@@ -1324,8 +1761,11 @@ impl Application for DocumentsApp {
                 let f = 1.0 / self.zoom;
                 self.zoom_at(f, cx, cy);
             }
+            Key::Character(c) if (c == "r" || c == "R") && self.sidebar && !self.thumb_sel.is_empty() => self.rotate_pages(1),
+            Key::Character(c) if (c == "l" || c == "L") && self.sidebar && !self.thumb_sel.is_empty() => self.rotate_pages(-1),
             Key::Character(c) if c == "r" || c == "R" => self.rotate(1),
             Key::Character(c) if c == "l" || c == "L" => self.rotate(-1),
+            Key::Character(c) if c == "t" => self.toggle_sidebar(),
             Key::Character(c) if c == "o" => self.open_dialog(),
             Key::Character(c) if c == "q" => {
                 if self.dirty && !self.quit_armed {
@@ -1346,6 +1786,7 @@ impl Application for DocumentsApp {
                     self.edit(Edit::Delete { page, index });
                 }
             }
+            Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) if self.sidebar && !self.thumb_sel.is_empty() => self.delete_pages(),
             Key::Character(c) if c == "/" => {
                 self.open_find();
                 self.restart_search();
@@ -1354,6 +1795,7 @@ impl Application for DocumentsApp {
             Key::Named(NamedKey::Escape) if self.find.is_some() => self.close_find(),
             Key::Named(NamedKey::Escape) if self.picked.is_some() => self.picked = None,
             Key::Named(NamedKey::Escape) if self.selection.is_some() => self.selection = None,
+            Key::Named(NamedKey::Escape) if !self.thumb_sel.is_empty() => self.thumb_sel.clear(),
             Key::Named(NamedKey::Escape) => self.set_tool(Tool::Select),
             Key::Named(NamedKey::ArrowUp) => self.scroll_by(0.0, -KEY_SCROLL_PX),
             Key::Named(NamedKey::ArrowDown) => self.scroll_by(0.0, KEY_SCROLL_PX),
@@ -1380,6 +1822,7 @@ impl Application for DocumentsApp {
         self.win = (size.width, size.height);
         self.scale = scale;
         self.store.begin_frame();
+        self.thumbs.begin_frame();
         let mut pc = PaintCtx::new();
         // The standard root plate (cce-ui PlateSpec::window); the document is
         // full-bleed content drawn on it.
@@ -1417,6 +1860,8 @@ impl Application for DocumentsApp {
             }
             visible.push((i, rect));
         }
+        // Pages, and everything drawn over them, stay right of the sidebar.
+        pc.push_clip(self.view_rect());
         let doc = self.doc.take().unwrap();
         for (i, rect) in &visible {
             // White page ground: placeholder while rendering.
@@ -1458,6 +1903,10 @@ impl Application for DocumentsApp {
         }
 
         self.paint_overlays(&mut pc, &rects, (ox, oy));
+        pc.pop_clip();
+        if self.sidebar {
+            self.paint_sidebar(&mut pc, scale);
+        }
 
         // HUD: file name, page, zoom (top-left chip).
         let doc = self.doc.as_ref().unwrap();
@@ -1471,14 +1920,16 @@ impl Application for DocumentsApp {
         // text the control text inset inside the box.
         let inset = cce_ui::layout::root_plate_inset();
         let text_in = cce_ui::layout::CONTROL_TEXT_INSET;
-        let w = 2.0 * text_in + hud.chars().count() as f32 * 6.6;
-        pc.quad(Rect { x: inset, y: inset, width: w, height: 24.0 }, [0.0, 0.0, 0.0, 0.45]);
-        pc.text(hud, inset + text_in, inset + 5.0, 12.0, [230, 230, 230]);
+        let x0 = self.view_x() as f32 + inset;
+        let fs = self.font_system.get_or_insert_with(cce_ui::create_font_system);
+        let w = 2.0 * text_in + chrome::width_of(fs, &hud, 12.0);
+        pc.quad(Rect { x: x0, y: inset, width: w, height: 24.0 }, [0.0, 0.0, 0.0, 0.45]);
+        pc.text(hud, x0 + text_in, inset + 5.0, 12.0, [230, 230, 230]);
         if let Some(status) = self.status.clone() {
             let fs = self.font_system.get_or_insert_with(cce_ui::create_font_system);
             let w = 2.0 * text_in + chrome::width_of(fs, &status, 12.0);
-            pc.quad(Rect { x: inset, y: inset + 30.0, width: w, height: 24.0 }, [0.0, 0.0, 0.0, 0.6]);
-            pc.text(status, inset + text_in, inset + 35.0, 12.0, [255, 220, 150]);
+            pc.quad(Rect { x: x0, y: inset + 30.0, width: w, height: 24.0 }, [0.0, 0.0, 0.0, 0.6]);
+            pc.text(status, x0 + text_in, inset + 35.0, 12.0, [255, 220, 150]);
         }
         if let Some((buttons, rects)) = self.toolbar() {
             chrome::paint_toolbar(&mut pc, &buttons, &rects);

@@ -25,6 +25,10 @@
 //! saves that. The update then holds what the edits touched, and the next
 //! save appends to the file just written.
 //!
+//! **Undo replays too.** Taking back a step reloads the file and replays the
+//! journal without it, so every kind of change — marks, field values, page
+//! operations — undoes the same way; redo applies the step again.
+//!
 //! **Search never holds up the page.** It runs one page per turn of the
 //! loop, and every turn first takes whatever requests are queued.
 //!
@@ -45,7 +49,7 @@ use pdfium_render::prelude::{
 };
 
 use crate::doc::{Job, PageSize};
-use crate::markup::{Annot, AnnotKind, Edit, FieldKind, MarkupKind};
+use crate::markup::{move_dest, Annot, AnnotKind, Edit, FieldKind, MarkupKind, PageOp};
 use crate::text::{PageText, PtRect, TextChar};
 use crate::Message;
 
@@ -87,7 +91,10 @@ enum Request {
     TextNow { doc: u64, page: usize, reply: mpsc::Sender<Option<Arc<PageText>>> },
     Annots { doc: u64, page: usize },
     Edit { doc: u64, edit: Edit },
+    Pages { doc: u64, op: PageOp },
     Undo { doc: u64 },
+    Redo { doc: u64 },
+    Extract { doc: u64, pages: Vec<usize>, to: PathBuf, reply: mpsc::Sender<Result<(), String>> },
     FieldValue { doc: u64, page: usize, index: usize, reply: mpsc::Sender<Option<String>> },
     Save { doc: u64, to: PathBuf, reply: mpsc::Sender<Result<(), String>> },
     Search { doc: u64, generation: u64, query: String },
@@ -195,9 +202,28 @@ impl Engine {
         let _ = self.tx.send(Request::Edit { doc, edit });
     }
 
-    /// Take back the last annotation this session added.
+    /// Rearrange pages. `Message::Restructured` follows.
+    pub fn pages(&self, doc: u64, op: PageOp) {
+        let _ = self.tx.send(Request::Pages { doc, op });
+    }
+
+    /// Take back the last change since the file was opened or saved, or
+    /// apply again the last one taken back. `Message::Restructured` follows
+    /// when there was one.
     pub fn undo(&self, doc: u64) {
         let _ = self.tx.send(Request::Undo { doc });
+    }
+
+    pub fn redo(&self, doc: u64) {
+        let _ = self.tx.send(Request::Redo { doc });
+    }
+
+    /// Write `pages` of the document as shown (unsaved changes included) to
+    /// a new PDF at `to`.
+    pub fn extract(&self, doc: u64, pages: Vec<usize>, to: &Path) -> Result<(), String> {
+        let (reply, rx) = mpsc::channel();
+        self.tx.send(Request::Extract { doc, pages, to: to.to_path_buf(), reply }).map_err(|e| e.to_string())?;
+        rx.recv().map_err(|e| e.to_string())?
     }
 
     /// A form field's current value.
@@ -239,10 +265,9 @@ struct Pdf {
 #[derive(Debug, Clone)]
 enum Op {
     /// `name` is the /NM given to an annotation the edit creates, the same
-    /// on replay so a later undo finds it there too.
+    /// on every replay.
     Edit { edit: Edit, name: Option<String> },
-    /// Undo: remove the annotation of that name.
-    Remove { page: usize, name: String },
+    Pages(PageOp),
 }
 
 /// The document the app has open: what it shows, and what it would save.
@@ -253,46 +278,98 @@ struct Open {
     source: PathBuf,
     /// Changes since the last save, in order.
     journal: Vec<Op>,
-    /// Annotations added this session, newest last, by page and /NM, for
-    /// undo.
-    added: Vec<(usize, String)>,
+    /// Changes taken back, newest last, for redo. Any new change clears it.
+    redone: Vec<Op>,
 }
 
 impl Open {
     fn load(lib: &Lib, id: u64, path: &Path) -> Result<Self, String> {
-        Ok(Open { id, view: Pdf::load(lib, path)?, source: path.to_path_buf(), journal: Vec::new(), added: Vec::new() })
+        Ok(Open { id, view: Pdf::load(lib, path)?, source: path.to_path_buf(), journal: Vec::new(), redone: Vec::new() })
     }
 
     fn close(self, lib: &Lib) {
         self.view.close(lib);
     }
 
+    fn dirty(&self) -> bool {
+        !self.journal.is_empty()
+    }
+
     /// Apply an edit to the document shown, and record it.
     fn edit(&mut self, lib: &Lib, edit: Edit) -> Result<(), String> {
         let creates = matches!(edit, Edit::Markup { .. } | Edit::Ink { .. } | Edit::Note { .. });
-        let name = creates.then(unique_name);
         let page = edit.page();
-        let op = Op::Edit { edit, name: name.clone() };
+        let op = Op::Edit { edit, name: creates.then(unique_name) };
         apply(lib, &mut self.view, &op)?;
         generate_appearances(lib, self.view.page(lib, page).ok_or("no such page")?);
-        if let Some(name) = name {
-            self.added.push((page, name));
-        }
         self.journal.push(op);
+        self.redone.clear();
         Ok(())
     }
 
-    /// Remove the newest annotation this session added; its page.
-    fn undo(&mut self, lib: &Lib) -> Option<usize> {
-        while let Some((page, name)) = self.added.pop() {
-            let op = Op::Remove { page, name };
-            if apply(lib, &mut self.view, &op).is_ok() {
-                self.journal.push(op);
-                return Some(page);
-            }
-            // Already deleted by hand: take back the one before it.
+    /// Rearrange the pages of the document shown, and record it.
+    fn pages(&mut self, lib: &Lib, op: PageOp) -> Result<(), String> {
+        let op = Op::Pages(op);
+        apply(lib, &mut self.view, &op)?;
+        self.journal.push(op);
+        self.redone.clear();
+        Ok(())
+    }
+
+    /// Take back the last change: reload and replay the journal without it.
+    /// False when there is nothing to take back.
+    fn undo(&mut self, lib: &Lib) -> Result<bool, String> {
+        let Some(op) = self.journal.pop() else { return Ok(false) };
+        self.redone.push(op);
+        self.rebuild(lib)?;
+        Ok(true)
+    }
+
+    /// Apply the last change taken back again.
+    fn redo(&mut self, lib: &Lib) -> Result<bool, String> {
+        let Some(op) = self.redone.pop() else { return Ok(false) };
+        if let Op::Edit { edit, .. } = &op {
+            let page = edit.page();
+            apply(lib, &mut self.view, &op)?;
+            generate_appearances(lib, self.view.page(lib, page).ok_or("no such page")?);
+        } else {
+            apply(lib, &mut self.view, &op)?;
         }
-        None
+        self.journal.push(op);
+        Ok(true)
+    }
+
+    /// The document shown, made again from the source and the journal.
+    fn rebuild(&mut self, lib: &Lib) -> Result<(), String> {
+        let mut fresh = Pdf::load(lib, &self.source)?;
+        if let Err(e) = replay(lib, &mut fresh, &self.journal) {
+            fresh.close(lib);
+            return Err(e);
+        }
+        std::mem::replace(&mut self.view, fresh).close(lib);
+        Ok(())
+    }
+
+    /// `pages` of the document shown, as a new PDF at `to`.
+    fn extract(&mut self, lib: &Lib, pages: &[usize], to: &Path) -> Result<(), String> {
+        if pages.is_empty() {
+            return Err("no pages chosen".to_string());
+        }
+        let indices: Vec<c_int> = pages.iter().map(|&p| p as c_int).collect();
+        unsafe {
+            let new = lib.FPDF_CreateNewDocument();
+            if new.is_null() {
+                return Err("PDFium could not make a document".to_string());
+            }
+            let copied = lib.is_true(lib.FPDF_ImportPagesByIndex(new, self.view.doc, indices.as_ptr(), indices.len() as c_ulong, 0));
+            let mut sink = Sink { fw: FPDF_FILEWRITE { version: 1, WriteBlock: Some(write_block) }, out: Vec::new() };
+            let saved = copied && lib.is_true(lib.FPDF_SaveAsCopy(new, &mut sink.fw, 0));
+            lib.FPDF_CloseDocument(new);
+            if !saved || sink.out.is_empty() {
+                return Err("PDFium could not copy the pages".to_string());
+            }
+            write_atomically(to, &sink.out)
+        }
     }
 
     /// Save to `to`: a fresh copy of `source` with the journal replayed,
@@ -319,12 +396,19 @@ impl Open {
         };
         write_atomically(to, &bytes)?;
         self.journal.clear();
+        self.redone.clear();
         self.source = to.to_path_buf();
         Ok(())
     }
 }
 
 impl Pdf {
+    /// Load a PDF with its form-fill environment. Always on, even for a
+    /// copy made only to save: it is what rebuilds a reloaded page's
+    /// annotation list, and with it the appearance streams of new marks. On
+    /// a form marked /NeedAppearances that also draws the touched page's
+    /// fields their appearances, and the save carries them (about 10 KB per
+    /// page of the CUPS sample) — what that flag asks a viewer to do anyway.
     fn load(lib: &Lib, path: &Path) -> Result<Self, String> {
         let doc = unsafe { lib.FPDF_LoadDocument(&path.to_string_lossy(), None) };
         if doc.is_null() {
@@ -351,6 +435,26 @@ impl Pdf {
 
     fn page_count(&self, lib: &Lib) -> usize {
         unsafe { lib.FPDF_GetPageCount(self.doc) }.max(0) as usize
+    }
+
+    /// Every page's size in display points.
+    fn sizes(&mut self, lib: &Lib) -> Vec<PageSize> {
+        (0..self.page_count(lib))
+            .map(|i| self.page(lib, i).map(|p| Frame::of(lib, p).size()).unwrap_or(PageSize { w: 612.0, h: 792.0 }))
+            .collect()
+    }
+
+    /// Close every loaded page: page operations shift the indices they are
+    /// kept under.
+    fn close_pages(&mut self, lib: &Lib) {
+        for (_, p) in self.pages.drain() {
+            unsafe {
+                if !self.form.is_null() {
+                    lib.FORM_OnBeforeClosePage(p, self.form);
+                }
+                lib.FPDF_ClosePage(p);
+            }
+        }
     }
 
     fn page(&mut self, lib: &Lib, index: usize) -> Option<FPDF_PAGE> {
@@ -418,9 +522,7 @@ fn run(lib: &Lib, rx: mpsc::Receiver<Request>, notify: calloop::channel::Sender<
                 }
                 search = None;
                 let result = Open::load(lib, id, &path).map(|mut o| {
-                    let sizes = (0..o.view.page_count(lib))
-                        .map(|i| o.view.page(lib, i).map(|p| Frame::of(lib, p).size()).unwrap_or(PageSize { w: 612.0, h: 792.0 }))
-                        .collect();
+                    let sizes = o.view.sizes(lib);
                     open = Some(o);
                     sizes
                 });
@@ -435,7 +537,7 @@ fn run(lib: &Lib, rx: mpsc::Receiver<Request>, notify: calloop::channel::Sender<
                             .ok()
                     })
                     .map(|rgba| job.finish(rgba));
-                notify.send(Message::Page { generation: job.generation, page: job.page, result }).is_ok()
+                notify.send(Message::Page { slot: job.slot, generation: job.generation, page: job.page, result }).is_ok()
             }
             Some(Request::Text { doc, page }) => match current(&mut open, doc) {
                 Some(o) => {
@@ -456,21 +558,51 @@ fn run(lib: &Lib, rx: mpsc::Receiver<Request>, notify: calloop::channel::Sender<
                 Some(o) => {
                     let page = edit.page();
                     let ok = o.edit(lib, edit).map_err(|e| log::warn!("edit on page {}: {e}", page + 1)).is_ok();
-                    notify.send(Message::Edited { doc, page, ok }).is_ok()
+                    notify.send(Message::Edited { doc, page, ok, dirty: o.dirty() }).is_ok()
                         && notify.send(Message::Annots { doc, page, annots: Arc::new(annots(lib, &mut o.view, page)) }).is_ok()
                 }
                 None => true,
             },
-            Some(Request::Undo { doc }) => match current(&mut open, doc) {
-                Some(o) => match o.undo(lib) {
-                    Some(page) => {
-                        notify.send(Message::Edited { doc, page, ok: true }).is_ok()
-                            && notify.send(Message::Annots { doc, page, annots: Arc::new(annots(lib, &mut o.view, page)) }).is_ok()
-                    }
-                    None => true,
-                },
+            Some(Request::Pages { doc, op }) => match current(&mut open, doc) {
+                Some(o) => {
+                    let focus = op.lands_at();
+                    let ok = o.pages(lib, op).map_err(|e| log::warn!("page operation: {e}")).is_ok();
+                    let sizes = o.view.sizes(lib);
+                    notify.send(Message::Restructured { doc, sizes, dirty: o.dirty(), focus, ok }).is_ok()
+                }
                 None => true,
             },
+            Some(Request::Undo { doc }) | Some(Request::Redo { doc }) if current(&mut open, doc).is_none() => true,
+            Some(Request::Undo { doc }) => {
+                let o = current(&mut open, doc).expect("checked above");
+                match o.undo(lib) {
+                    Ok(false) => true,
+                    result => {
+                        let ok = result.map_err(|e| log::warn!("undo: {e}")).is_ok();
+                        let sizes = o.view.sizes(lib);
+                        notify.send(Message::Restructured { doc, sizes, dirty: o.dirty(), focus: None, ok }).is_ok()
+                    }
+                }
+            }
+            Some(Request::Redo { doc }) => {
+                let o = current(&mut open, doc).expect("checked above");
+                match o.redo(lib) {
+                    Ok(false) => true,
+                    result => {
+                        let ok = result.map_err(|e| log::warn!("redo: {e}")).is_ok();
+                        let sizes = o.view.sizes(lib);
+                        notify.send(Message::Restructured { doc, sizes, dirty: o.dirty(), focus: None, ok }).is_ok()
+                    }
+                }
+            }
+            Some(Request::Extract { doc, pages, to, reply }) => {
+                let result = match current(&mut open, doc) {
+                    Some(o) => o.extract(lib, &pages, &to),
+                    None => Err("no document open".to_string()),
+                };
+                let _ = reply.send(result);
+                true
+            }
             Some(Request::FieldValue { doc, page, index, reply }) => {
                 let _ = reply.send(current(&mut open, doc).and_then(|o| field_value(lib, &mut o.view, page, index)));
                 true
@@ -796,31 +928,10 @@ fn set_rect(lib: &Lib, a: FPDF_ANNOTATION, (l, b, r, t): (f32, f32, f32, f32)) {
     unsafe { lib.FPDFAnnot_SetRect(a, &rect) };
 }
 
-/// The index of the annotation named `name` on a page.
-fn find_named(lib: &Lib, page: FPDF_PAGE, name: &str) -> Option<c_int> {
-    let n = unsafe { lib.FPDFPage_GetAnnotCount(page) };
-    (0..n).find(|&i| unsafe {
-        let a = lib.FPDFPage_GetAnnot(page, i);
-        if a.is_null() {
-            return false;
-        }
-        let nm = read_wide(|buf, len| lib.FPDFAnnot_GetStringValue(a, "NM", buf, len));
-        lib.FPDFPage_CloseAnnot(a);
-        nm == name
-    })
-}
-
 fn apply(lib: &Lib, o: &mut Pdf, op: &Op) -> Result<(), String> {
     let (edit, name) = match op {
         Op::Edit { edit, name } => (edit.clone(), name.as_deref()),
-        Op::Remove { page, name } => {
-            let p = o.page(lib, *page).ok_or("no such page")?;
-            let i = find_named(lib, p, name).ok_or("no such annotation")?;
-            if !lib.is_true(unsafe { lib.FPDFPage_RemoveAnnot(p, i) }) {
-                return Err("PDFium could not remove it".to_string());
-            }
-            return Ok(());
-        }
+        Op::Pages(op) => return apply_pages(lib, o, op),
     };
     let page = o.page(lib, edit.page()).ok_or("no such page")?;
     let frame = Frame::of(lib, page);
@@ -945,16 +1056,75 @@ fn apply(lib: &Lib, o: &mut Pdf, op: &Op) -> Result<(), String> {
 /// it too, but would load the page's fonts and images, and a save writes
 /// whatever is loaded.
 fn replay(lib: &Lib, o: &mut Pdf, journal: &[Op]) -> Result<(), String> {
-    let mut touched = std::collections::BTreeSet::new();
     for op in journal {
         apply(lib, o, op)?;
-        touched.insert(match op {
-            Op::Edit { edit, .. } => edit.page(),
-            Op::Remove { page, .. } => *page,
-        });
+        // Right away: a later page operation renumbers the pages.
+        if let Op::Edit { edit, .. } = op {
+            o.reload_page(lib, edit.page());
+        }
     }
-    for page in touched {
-        o.reload_page(lib, page);
+    Ok(())
+}
+
+/// Rearrange the pages of a document.
+fn apply_pages(lib: &Lib, o: &mut Pdf, op: &PageOp) -> Result<(), String> {
+    let count = o.page_count(lib);
+    let valid = |pages: &[usize]| !pages.is_empty() && pages.iter().all(|&p| p < count);
+    match op {
+        PageOp::Rotate { pages, quarter_turns } => {
+            if !valid(pages) {
+                return Err("no such page".to_string());
+            }
+            for &i in pages {
+                let p = o.page(lib, i).ok_or("no such page")?;
+                unsafe {
+                    let turns = (lib.FPDFPage_GetRotation(p) + quarter_turns).rem_euclid(4);
+                    lib.FPDFPage_SetRotation(p, turns);
+                }
+                // The page's size and text boxes are read again on reload.
+                o.reload_page(lib, i);
+            }
+        }
+        PageOp::Delete { pages } => {
+            if !valid(pages) || pages.len() >= count {
+                return Err("a document keeps at least one page".to_string());
+            }
+            o.close_pages(lib);
+            let mut sorted = pages.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            for &i in sorted.iter().rev() {
+                unsafe { lib.FPDFPage_Delete(o.doc, i as c_int) };
+            }
+        }
+        PageOp::Move { pages, gap } => {
+            if !valid(pages) || *gap > count {
+                return Err("no such page".to_string());
+            }
+            o.close_pages(lib);
+            let indices: Vec<c_int> = pages.iter().map(|&p| p as c_int).collect();
+            let dest = move_dest(pages, *gap) as c_int;
+            if !lib.is_true(unsafe { lib.FPDF_MovePages(o.doc, indices.as_ptr(), indices.len() as c_ulong, dest) }) {
+                return Err("PDFium could not move the pages".to_string());
+            }
+        }
+        PageOp::Insert { from, at } => {
+            if *at > count {
+                return Err("no such page".to_string());
+            }
+            let src = unsafe { lib.FPDF_LoadDocument(&from.to_string_lossy(), None) };
+            if src.is_null() {
+                return Err(format!("could not open {}", from.display()));
+            }
+            o.close_pages(lib);
+            let n = unsafe { lib.FPDF_GetPageCount(src) }.max(0);
+            let all: Vec<c_int> = (0..n).collect();
+            let ok = unsafe { lib.FPDF_ImportPagesByIndex(o.doc, src, all.as_ptr(), all.len() as c_ulong, *at as c_int) };
+            unsafe { lib.FPDF_CloseDocument(src) };
+            if !lib.is_true(ok) {
+                return Err("PDFium could not insert the pages".to_string());
+            }
+        }
     }
     Ok(())
 }
@@ -1058,6 +1228,7 @@ mod tests {
         a_rotated_page_maps_its_text_where_it_is_drawn(&lib, src, &dir);
         edits_survive_an_incremental_save(&lib, src, &dir);
         a_check_box_toggles_to_its_own_on_state(&lib, &dir);
+        pages_rearrange_and_keep_links_and_outlines(&lib, src, &dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1118,7 +1289,7 @@ mod tests {
         // Shown first, as in the app: rendering loads the page's fonts,
         // which a save must not drag along.
         let size = Frame::of(lib, o.view.page(lib, 0).unwrap()).size();
-        let job = Job { generation: 0, doc: 3, page: 0, dpi: 96, path: path.clone(), size, quarter_turns: 0 };
+        let job = Job { slot: 0, generation: 0, doc: 3, page: 0, dpi: 96, path: path.clone(), size, quarter_turns: 0 };
         render(lib, &mut o.view, &job).unwrap();
 
         let hit = search_page(lib, &mut o.view, 0, "Printer name").remove(0);
@@ -1131,7 +1302,7 @@ mod tests {
         o.edit(lib, Edit::Note { page: 0, at: (520.0, 100.0), contents: "check this".into() }).unwrap();
         // An undone stroke is gone.
         o.edit(lib, Edit::Ink { page: 0, points: vec![(100.0, 750.0), (200.0, 760.0)], width: 2.0 }).unwrap();
-        assert_eq!(o.undo(lib), Some(0));
+        assert!(o.undo(lib).unwrap());
 
         let list = annots(lib, &mut o.view, 0);
         let kinds: Vec<AnnotKind> = list.iter().map(|a| a.kind).filter(|k| !matches!(k, AnnotKind::Field(_))).collect();
@@ -1253,5 +1424,134 @@ trailer << /Root 1 0 R >>\n%%EOF\n";
         let dump = std::process::Command::new("qpdf").args(["--qdf", "--object-streams=disable"]).arg(&path).arg("-").output().unwrap();
         let dump = String::from_utf8_lossy(&dump.stdout);
         assert!(dump.contains("/AS /On") && dump.contains("/V /On"), "the on state is not /On:\n{dump}");
+    }
+
+    /// A small PDF: three pages reading "Page one/two/three", an outline
+    /// entry for each, and a link on page one to page three. Written by
+    /// hand, then rebuilt by qpdf so the xref is right.
+    fn three_pages(dir: &Path) -> Option<PathBuf> {
+        let mut pdf = String::from("%PDF-1.7\n");
+        let mut obj = |n: u32, body: &str| pdf.push_str(&format!("{n} 0 obj\n{body}\nendobj\n"));
+        obj(1, "<< /Type /Catalog /Pages 2 0 R /Outlines 10 0 R >>");
+        obj(2, "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>");
+        let page = |contents: u32, annots: &str| {
+            format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents {contents} 0 R /Resources << /Font << /F1 9 0 R >> >> {annots}>>")
+        };
+        obj(3, &page(6, "/Annots [14 0 R] "));
+        obj(4, &page(7, ""));
+        obj(5, &page(8, ""));
+        for (n, word) in [(6, "one"), (7, "two"), (8, "three")] {
+            let text = format!("BT /F1 24 Tf 50 150 Td (Page {word}) Tj ET");
+            obj(n, &format!("<< /Length {} >>\nstream\n{text}\nendstream", text.len()));
+        }
+        obj(9, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        obj(10, "<< /Type /Outlines /First 11 0 R /Last 13 0 R /Count 3 >>");
+        obj(11, "<< /Title (One) /Parent 10 0 R /Next 12 0 R /Dest [3 0 R /Fit] >>");
+        obj(12, "<< /Title (Two) /Parent 10 0 R /Prev 11 0 R /Next 13 0 R /Dest [4 0 R /Fit] >>");
+        obj(13, "<< /Title (Three) /Parent 10 0 R /Prev 12 0 R /Dest [5 0 R /Fit] >>");
+        obj(14, "<< /Type /Annot /Subtype /Link /Rect [40 140 200 180] /Border [0 0 0] /Dest [5 0 R /Fit] >>");
+        pdf.push_str("trailer << /Root 1 0 R >>\n%%EOF\n");
+        let rough = dir.join("pages-rough.pdf");
+        let path = dir.join("pages.pdf");
+        std::fs::write(&rough, pdf).ok()?;
+        let status = std::process::Command::new("qpdf").arg(&rough).arg(&path).stderr(std::process::Stdio::null()).status();
+        status.is_ok_and(|s| matches!(s.code(), Some(0) | Some(3))).then_some(path)
+    }
+
+    /// Where each link on a page leads, as page indices.
+    fn link_targets(lib: &Lib, o: &mut Pdf, page: usize) -> Vec<c_int> {
+        let p = o.page(lib, page).unwrap();
+        let mut out = Vec::new();
+        let mut pos: c_int = 0;
+        let mut link = std::ptr::null_mut();
+        unsafe {
+            while lib.is_true(lib.FPDFLink_Enumerate(p, &mut pos, &mut link)) {
+                let mut dest = lib.FPDFLink_GetDest(o.doc, link);
+                if dest.is_null() {
+                    let action = lib.FPDFLink_GetAction(link);
+                    if !action.is_null() {
+                        dest = lib.FPDFAction_GetDest(o.doc, action);
+                    }
+                }
+                out.push(if dest.is_null() { -1 } else { lib.FPDFDest_GetDestPageIndex(o.doc, dest) });
+            }
+        }
+        out
+    }
+
+    /// The top-level outline: each entry's title and target page index.
+    fn outline(lib: &Lib, o: &Pdf) -> Vec<(String, c_int)> {
+        let mut out = Vec::new();
+        unsafe {
+            let mut b = lib.FPDFBookmark_GetFirstChild(o.doc, std::ptr::null_mut());
+            while !b.is_null() {
+                let title = read_wide(|buf, len| lib.FPDFBookmark_GetTitle(b, buf as *mut c_void, len));
+                let dest = lib.FPDFBookmark_GetDest(o.doc, b);
+                out.push((title, if dest.is_null() { -1 } else { lib.FPDFDest_GetDestPageIndex(o.doc, dest) }));
+                b = lib.FPDFBookmark_GetNextSibling(o.doc, b);
+            }
+        }
+        out
+    }
+
+    fn page_says(lib: &Lib, o: &mut Pdf, page: usize, words: &str) -> bool {
+        let t = page_text(lib, o, page);
+        t.text(0, t.len()).contains(words)
+    }
+
+    /// Rotate, move, delete and insert pages; undo and redo; save and read
+    /// back: the pages are in the new order, and the link and the outline
+    /// still lead to the pages they named.
+    fn pages_rearrange_and_keep_links_and_outlines(lib: &Lib, src: &Path, dir: &Path) {
+        let Some(path) = three_pages(dir) else { return eprintln!("skipped pages: qpdf failed") };
+        let mut o = Open::load(lib, 7, &path).unwrap();
+        o.pages(lib, PageOp::Rotate { pages: vec![0], quarter_turns: 1 }).unwrap();
+        o.pages(lib, PageOp::Move { pages: vec![2], gap: 0 }).unwrap(); // three, one, two
+        o.pages(lib, PageOp::Delete { pages: vec![2] }).unwrap(); // three, one
+        assert!(o.pages(lib, PageOp::Delete { pages: vec![0, 1] }).is_err(), "deleted every page");
+        o.pages(lib, PageOp::Insert { from: src.to_path_buf(), at: 2 }).unwrap(); // three, one, form
+
+        let check = |lib: &Lib, v: &mut Pdf| {
+            assert_eq!(v.page_count(lib), 3);
+            assert!(page_says(lib, v, 0, "Page three"));
+            assert!(page_says(lib, v, 1, "Page one"));
+            assert!(page_says(lib, v, 2, "Printer name"));
+            let one = v.page(lib, 1).unwrap();
+            assert_eq!(unsafe { lib.FPDFPage_GetRotation(one) }, 1, "page one keeps its turn");
+            // Page one's link still leads to page three, now first.
+            assert_eq!(link_targets(lib, v, 1), vec![0]);
+            // The outline follows the pages; the deleted one leads nowhere.
+            assert_eq!(outline(lib, v), vec![("One".to_string(), 1), ("Two".to_string(), -1), ("Three".to_string(), 0)]);
+        };
+        check(lib, &mut o.view);
+
+        // Undo takes back the insert, redo puts it back.
+        assert!(o.undo(lib).unwrap());
+        assert_eq!(o.view.page_count(lib), 2);
+        assert!(o.redo(lib).unwrap());
+        check(lib, &mut o.view);
+
+        // Extract pages one and the form into a file of their own.
+        let out = dir.join("extracted.pdf");
+        o.extract(lib, &[1, 2], &out).unwrap();
+        let mut x = Pdf::load(lib, &out).unwrap();
+        assert_eq!(x.page_count(lib), 2);
+        assert!(page_says(lib, &mut x, 0, "Page one"));
+        assert!(page_says(lib, &mut x, 1, "Printer name"));
+        x.close(lib);
+
+        o.save(lib, &path).unwrap();
+        o.close(lib);
+        assert!(run_ok(std::process::Command::new("qpdf").arg("--check").arg(&path).stdout(std::process::Stdio::null())), "qpdf --check");
+        let mut back = Pdf::load(lib, &path).unwrap();
+        check(lib, &mut back);
+        back.close(lib);
+        // poppler agrees on the order.
+        let order = std::process::Command::new("pdftotext").arg(&path).arg("-").output();
+        if let Ok(order) = order {
+            let text = String::from_utf8_lossy(&order.stdout);
+            let (a, b) = (text.find("Page three"), text.find("Page one"));
+            assert!(a.is_some() && b.is_some() && a < b, "poppler reads: {text}");
+        }
     }
 }

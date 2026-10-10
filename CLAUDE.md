@@ -7,20 +7,22 @@ particular to this crate. The plan — the two engines, the library and
 format choices, six milestones — is the design doc "cce-documents: PDF
 editor and word processor — proposal"
 (claude.ai/code/artifact/50527ccf-8449-496e-94ba-7ed26dc5a2f6). Milestones
-1 and 2 are here: PDFium rendering, text selection and copy, search; and
+1–3 are here: PDFium rendering, text selection and copy, search;
 highlight / underline / strike, ink, notes, form filling (text fields,
-check boxes, radio buttons), undo of added marks, and incremental saves.
+check boxes, radio buttons) and incremental saves; and the page sidebar —
+thumbnails, reorder by drag, rotate, delete, insert (merge) and extract —
+with undo and redo of every kind of change.
 Split from cce-preview on 2026-10-09; pictures went to cce-image.
 
 ## Shape
 
 | File | What it owns |
 | --- | --- |
-| `main.rs` | The `Application`: page layout and the viewport (scroll, zoom at the pointer, rotation), tools (select / draw / note), selection, picking marks, the field and note editors, the find bar, save, keys |
-| `chrome.rs` | The markup toolbar and the one-line text fields, drawn into the display list and measured with the renderer's shaping |
-| `doc.rs` | `Backend` (PDFium or poppler), `Document`, and the GPU `PageStore` (lazy renders, DPI upgrades, `invalidate` after an edit, LRU, generations) |
+| `main.rs` | The `Application`: page layout and the viewport (scroll, zoom at the pointer, rotation), the page sidebar (thumbnails, selection, drag to reorder, its buttons), tools (select / draw / note), selection, picking marks, the field and note editors, the find bar, save, keys |
+| `chrome.rs` | The markup toolbar (wrapping into rows when narrow), buttons, and the one-line text fields, drawn into the display list and measured with the renderer's shaping |
+| `doc.rs` | `Backend` (PDFium or poppler), `Document`, and the GPU `PageStore` — two of them, the pages and the thumbnails, told apart by `slot` (lazy renders, DPI upgrades, `invalidate` after an edit, LRU, generations) |
 | `engine.rs` | PDFium on its own thread, through its C API: open, render, text, search, annotations, edits, the edit journal, save; `Frame` maps PDF page space to display points both ways |
-| `markup.rs` | Pure data: `Annot` as the app sees it, `Edit`, picking under the pointer |
+| `markup.rs` | Pure data: `Annot` as the app sees it, `Edit`, `PageOp`, picking under the pointer, where moved pages land |
 | `trim.rs` | Cuts PDFium's incremental update to the objects that changed (lopdf) |
 | `text.rs` | Pure selection geometry: a page's chars with boxes, caret hit-testing, highlight rects, copied text |
 | `poppler.rs` | The fallback: `pdfinfo` sizes, `pdftoppm` renders, view-only |
@@ -56,12 +58,15 @@ holds in memory**, changed or not, and `FPDF_LoadPage` alone loads the
 page's content stream and resources. Saving straight from the document on
 screen added 285 KB to the 276 KB CUPS sample for one highlight. So:
 
-1. Every edit is applied to the shown document **and recorded** (`Op`, with
-   the /NM it gave a new annotation, so undo-by-name replays too).
-2. A save loads the file afresh (never rendered), replays the journal,
-   closes and reloads each touched page — which rebuilds the page's
-   annotation list and with it the missing appearance streams, without a
-   render — and asks PDFium for an incremental save.
+1. Every change is applied to the shown document **and recorded** (`Op`: an
+   `Edit` with the /NM it gave a new annotation, or a `PageOp`).
+2. A save loads the file afresh (never rendered), replays the journal —
+   closing and reloading each edited page right after its edit, which
+   rebuilds the page's annotation list and with it the missing appearance
+   streams (later page operations renumber pages, so it cannot wait) — and
+   asks PDFium for an incremental save. The form-fill environment must be
+   on for that rebuild; on a `/NeedAppearances` form it also gives the
+   touched page's fields appearances, which the save carries (~10 KB).
 3. `trim::trim` then keeps only the objects that are new or differ from
    the original (streams compared decoded), and writes them as the update
    with an explicit `/Prev` (lopdf omits it when it did not read the offset
@@ -69,6 +74,21 @@ screen added 285 KB to the 276 KB CUPS sample for one highlight. So:
 4. Written to a sibling temporary and renamed over the target. The journal
    empties and the saved file becomes the source of the next save, which
    appends a second update.
+
+**Undo and redo** use the same journal: undo pops the last op and rebuilds
+the shown document (fresh load + replay), redo applies the popped op again.
+Both, and every page operation, answer with `Message::Restructured`, after
+which the app drops everything it keeps by page index (texts, annotations,
+search hits, selections) and either invalidates its renders (same page
+sizes: the old images stay up until the new land) or resets them. Nothing
+before the last save can be undone.
+
+**Page operations** close every loaded page first (indices shift under
+them). PDFium keeps page objects when it reorders, so links and outline
+entries keep leading to their pages; a deleted page's entries lead nowhere
+(`FPDFDest_GetDestPageIndex` = -1), never to the wrong page. Extract copies
+pages of the document as shown into a new file (a full save, not
+incremental); fields there lose their form (no AcroForm is copied).
 
 **Appearance streams**: PDFium writes an annotation's /AP only when a
 render (or an annotation-list rebuild) first meets it without one; never on
@@ -80,7 +100,10 @@ The test `engine::tests::pdfium_round_trips` covers all of it: marks, a
 note, undo, a text field typed into, a check box whose on state is `/On`,
 the original bytes kept, the update under 64 KB after a render, a second
 save appending, `qpdf --check`, PDFium reading it back, `/AP` on every
-mark, and poppler drawing the highlight.
+mark, poppler drawing the highlight; and on a hand-written three-page PDF
+with an outline and a link: rotate, move, delete, insert, undo, redo,
+extract and save, with the link and outline still leading to the right
+pages afterwards and poppler reading the new order.
 
 ## Coordinates (the thing to get right)
 
@@ -124,3 +147,6 @@ qpdf exits 3 (not 0) when it repaired a file, which the tests accept.
   for the dictionaries, and `pdftoppm` for poppler's drawing.
 - A window close quits at once (cce-ui has no close-request hook), so
   unsaved changes are only guarded on `q`.
+- Do not click Insert… or Extract… in a shadow: they open the portal file
+  chooser, which appears on the LIVE display (the shadow shares the
+  session bus). The engine test covers what they do.

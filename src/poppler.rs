@@ -97,7 +97,7 @@ fn worker(rx: Arc<Mutex<mpsc::Receiver<Job>>>, notify: calloop::channel::Sender<
             .map(|rgba| job.finish(rgba))
             .map_err(|e| log::warn!("{}: page {}: {e}", job.path.display(), job.page + 1))
             .ok();
-        let msg = Message::Page { generation: job.generation, page: job.page, result };
+        let msg = Message::Page { slot: job.slot, generation: job.generation, page: job.page, result };
         if notify.send(msg).is_err() {
             return;
         }
