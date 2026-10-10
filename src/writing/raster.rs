@@ -12,7 +12,7 @@ use cce_ui::cosmic_text::{CacheKey, FontSystem, SwashCache, SwashContent};
 use image::RgbaImage;
 
 use super::edit::Doc;
-use super::layout::{self, Item};
+use super::layout::Item;
 use crate::doc::Job;
 use crate::Message;
 
@@ -51,9 +51,7 @@ impl Raster {
         let mut img = RgbaImage::from_pixel(w, h, image::Rgba([255, 255, 255, 255]));
         let (fx, fy, ..) = doc.frame;
         let mut items = doc.page_items(page, fx, fy);
-        if doc.style.page_numbers && doc.page_count > 1 {
-            items.extend(layout::page_number(fs, &doc.style, page));
-        }
+        items.extend(doc.extras(fs, page));
         let swash = self.swash.get_or_insert_with(SwashCache::new);
         for item in &items {
             match item {
@@ -120,7 +118,7 @@ impl Raster {
                         blend(&mut img, x0 + xx as i32, y0 + yy as i32, [px[0], px[1], px[2]], px[3]);
                     }
                 }
-                Item::Link { .. } => {}
+                Item::Link { .. } | Item::GoTo { .. } => {}
             }
         }
         img
@@ -162,5 +160,27 @@ impl crate::doc::Render for Painter {
     fn render(&self, job: Job) {
         let doc = Arc::clone(&self.doc.lock().unwrap_or_else(|e| e.into_inner()));
         let _ = self.tx.send((doc, job));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Render a Markdown file's pages to PNGs, to look at:
+    /// `CCE_RENDER=<file.md> CCE_RENDER_OUT=<dir> cargo test -p cce-documents render_pages -- --ignored`.
+    #[test]
+    #[ignore]
+    fn render_pages() {
+        let (Some(src), Some(out)) = (std::env::var_os("CCE_RENDER"), std::env::var_os("CCE_RENDER_OUT")) else { return };
+        let src = std::path::PathBuf::from(src);
+        let text = std::fs::read_to_string(&src).unwrap();
+        let mut fs = cce_ui::create_font_system_with_system_fonts();
+        let (doc, _) = super::super::edit::Layouter::default().relayout(&mut fs, &text, src.parent().unwrap());
+        let mut r = super::Raster::default();
+        for p in 0..doc.page_count {
+            r.page(&mut fs, &doc, p, 110).save(std::path::Path::new(&out).join(format!("page-{p}.png"))).unwrap();
+        }
+        let bytes = crate::writing::typeset_text(&mut fs, &text, &src).unwrap().1;
+        std::fs::write(std::path::Path::new(&out).join("out.pdf"), bytes).unwrap();
+        eprintln!("{} pages", doc.page_count);
     }
 }

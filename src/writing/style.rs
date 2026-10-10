@@ -22,8 +22,25 @@ heading level=2 font="Noto Serif" size=16 bold=#true space-before=16 space-after
 heading level=3 font="Noto Serif" size=12.5 bold=#true space-before=12 space-after=6
 mono font="Noto Sans Mono" size=9.5
 align "left"
-page-numbers #true
+footer center="{page}"
 "#;
+
+/// A book: A5, justified, paragraphs marked by a first-line indent rather
+/// than space, each chapter on a new page, its title in the page head.
+pub const BOOK: &str = r#"// The built-in book style.
+page size="A5" margin-top=20 margin-bottom=22 margin-left=18 margin-right=18
+body font="Noto Serif" size=10.5 leading=1.4 space-after=0 indent=14
+heading level=1 font="Noto Serif" size=20 bold=#false space-before=60 space-after=28 page-break=#true
+heading level=2 font="Noto Serif" size=13 bold=#true space-before=14 space-after=6
+heading level=3 font="Noto Serif" size=11 bold=#true space-before=10 space-after=4
+mono font="Noto Sans Mono" size=9
+align "justify"
+header center="{section}" first=#false
+footer center="{page}"
+"#;
+
+/// The styles that come with the app: (name, KDL).
+pub const BUILT_IN: &[(&str, &str)] = &[("manuscript", MANUSCRIPT), ("book", BOOK)];
 
 const MM: f64 = 72.0 / 25.4;
 
@@ -39,6 +56,18 @@ pub struct HeadingStyle {
     pub face: Face,
     pub space_before: f64,
     pub space_after: f64,
+    /// Starts a new page.
+    pub break_before: bool,
+}
+
+/// A page's header or footer: text on the left, centre and right, with
+/// fields (`layout::Fields`) filled in; and whether the first page has it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Furniture {
+    pub left: String,
+    pub center: String,
+    pub right: String,
+    pub first: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,10 +87,13 @@ pub struct Style {
     pub leading: f64,
     /// Space after a paragraph, in points.
     pub space_after: f64,
+    /// A paragraph that follows another starts this far in, in points.
+    pub indent: f64,
     pub headings: [HeadingStyle; 3],
     pub mono: Face,
     pub align: Align,
-    pub page_numbers: bool,
+    pub header: Furniture,
+    pub footer: Furniture,
 }
 
 /// A named paper size in points.
@@ -121,10 +153,17 @@ impl Style {
             body: Face { family: "serif".into(), size: 11.0, bold: false },
             leading: 1.4,
             space_after: 6.0,
-            headings: std::array::from_fn(|_| HeadingStyle { face: Face { family: "serif".into(), size: 14.0, bold: true }, space_before: 12.0, space_after: 6.0 }),
+            indent: 0.0,
+            headings: std::array::from_fn(|_| HeadingStyle {
+                face: Face { family: "serif".into(), size: 14.0, bold: true },
+                space_before: 12.0,
+                space_after: 6.0,
+                break_before: false,
+            }),
             mono: Face { family: "monospace".into(), size: 9.5, bold: false },
             align: Align::Left,
-            page_numbers: true,
+            header: Furniture { first: true, ..Default::default() },
+            footer: Furniture { first: true, ..Default::default() },
         };
         s.apply_kdl(MANUSCRIPT).expect("the built-in style parses");
         s
@@ -165,6 +204,9 @@ impl Style {
                     if let Some(a) = num(node, "space-after") {
                         self.space_after = a;
                     }
+                    if let Some(i) = num(node, "indent") {
+                        self.indent = i;
+                    }
                 }
                 "heading" => {
                     let level = get(node, "level").and_then(|v| v.as_integer()).unwrap_or(1).clamp(1, 3) as usize;
@@ -176,6 +218,21 @@ impl Style {
                     if let Some(a) = num(node, "space-after") {
                         h.space_after = a;
                     }
+                    if let Some(b) = get(node, "page-break").and_then(|v| v.as_bool()) {
+                        h.break_before = b;
+                    }
+                }
+                "header" | "footer" => {
+                    let f = if node.name().value() == "header" { &mut self.header } else { &mut self.footer };
+                    *f = Furniture { first: true, ..Default::default() };
+                    for (key, slot) in [("left", &mut f.left), ("center", &mut f.center), ("right", &mut f.right)] {
+                        if let Some(t) = get(node, key).and_then(|v| v.as_string()) {
+                            *slot = t.to_string();
+                        }
+                    }
+                    if let Some(b) = get(node, "first").and_then(|v| v.as_bool()) {
+                        f.first = b;
+                    }
                 }
                 "mono" => apply_face(&mut self.mono, node),
                 "align" => {
@@ -184,28 +241,53 @@ impl Style {
                         _ => Align::Left,
                     }
                 }
-                "page-numbers" => self.page_numbers = node.entry(0).and_then(|e| e.value().as_bool()).unwrap_or(true),
+                "page-numbers" => self.page_numbers(node.entry(0).and_then(|e| e.value().as_bool()).unwrap_or(true)),
                 other => log::warn!("style: unknown node `{other}`"),
             }
         }
         Ok(())
     }
 
-    /// The style a document asks for: its `style:` (a user style file, or
-    /// the built-in), then its other front-matter keys on top.
-    pub fn for_document(front: &[(String, String)]) -> Style {
-        let mut style = Style::manuscript();
-        if let Some((_, name)) = front.iter().find(|(k, _)| k == "style") {
-            match std::fs::read_to_string(style_path(name)) {
-                Ok(text) => {
-                    if let Err(e) = style.apply_kdl(&text) {
-                        log::warn!("style {name}: {e}");
-                    }
+    /// `page-numbers`, as the styles before headers and footers had it: a
+    /// number centred in the footer, or none.
+    fn page_numbers(&mut self, on: bool) {
+        if on && self.footer.center.is_empty() {
+            self.footer.center = "{page}".into();
+        } else if !on {
+            for t in [&mut self.footer.left, &mut self.footer.center, &mut self.footer.right] {
+                if t.contains("{page}") {
+                    t.clear();
                 }
-                Err(_) if name == "manuscript" => {}
-                Err(e) => log::warn!("style {name}: {e}"),
             }
         }
+    }
+
+    /// The style named `name`: the user's file of that name, else the
+    /// built-in one, over the manuscript (which fills in what it leaves
+    /// out).
+    pub fn named(name: &str) -> Style {
+        let mut style = Style::manuscript();
+        match std::fs::read_to_string(style_path(name)) {
+            Ok(text) => {
+                if let Err(e) = style.apply_kdl(&text) {
+                    log::warn!("style {name}: {e}");
+                }
+            }
+            Err(e) => match BUILT_IN.iter().find(|(n, _)| *n == name) {
+                Some((_, kdl)) => style.apply_kdl(kdl).expect("the built-in styles parse"),
+                None => log::warn!("style {name}: {e}"),
+            },
+        }
+        style
+    }
+
+    /// The style a document asks for: its `style:` (a user style file, or
+    /// a built-in), then its other front-matter keys on top.
+    pub fn for_document(front: &[(String, String)]) -> Style {
+        let mut style = match front.iter().find(|(k, _)| k == "style") {
+            Some((_, name)) => Style::named(name),
+            None => Style::manuscript(),
+        };
         for (k, v) in front {
             match k.as_str() {
                 "page" => {
@@ -230,7 +312,18 @@ impl Style {
                     }
                 }
                 "align" => style.align = if v == "justify" { Align::Justify } else { Align::Left },
-                "page-numbers" => style.page_numbers = v != "false" && v != "no",
+                "indent" => {
+                    if let Some(i) = length(v, 1.0) {
+                        style.indent = i;
+                    }
+                }
+                "page-numbers" => style.page_numbers(v != "false" && v != "no"),
+                "header" => style.header.center = v.clone(),
+                "header-left" => style.header.left = v.clone(),
+                "header-right" => style.header.right = v.clone(),
+                "footer" => style.footer.center = v.clone(),
+                "footer-left" => style.footer.left = v.clone(),
+                "footer-right" => style.footer.right = v.clone(),
                 _ => {}
             }
         }
@@ -261,12 +354,45 @@ fn apply_face(face: &mut Face, node: &KdlNode) {
     }
 }
 
-pub fn style_path(name: &str) -> PathBuf {
+/// The styles there are: the built-in ones, then the user's (any
+/// `.kdl` in the styles folder), by name.
+pub fn available() -> Vec<String> {
+    let mut names: Vec<String> = BUILT_IN.iter().map(|(n, _)| n.to_string()).collect();
+    if let Ok(dir) = std::fs::read_dir(styles_dir()) {
+        let mut user: Vec<String> = dir
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                (p.extension().is_some_and(|x| x == "kdl")).then(|| p.file_stem()?.to_str().map(str::to_string)).flatten()
+            })
+            .filter(|n| !names.contains(n))
+            .collect();
+        user.sort();
+        names.extend(user);
+    }
+    names
+}
+
+/// A new document in style `name`: the user's `<name>.md` template beside
+/// the style when there is one, else front matter naming the style and an
+/// empty first heading.
+pub fn template(name: &str) -> String {
+    if let Ok(t) = std::fs::read_to_string(styles_dir().join(format!("{name}.md"))) {
+        return t;
+    }
+    format!("---\nstyle: {name}\n---\n# Untitled\n\n")
+}
+
+fn styles_dir() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("cce/documents/styles").join(format!("{name}.kdl"))
+    base.join("cce/documents/styles")
+}
+
+pub fn style_path(name: &str) -> PathBuf {
+    styles_dir().join(format!("{name}.kdl"))
 }
 
 #[cfg(test)]
@@ -289,7 +415,18 @@ mod tests {
         assert_eq!(s.body.family, "Noto Serif");
         assert_eq!(s.headings[0].face.size, 22.0);
         assert!(s.headings[1].face.bold);
-        assert!(s.page_numbers);
+        assert_eq!(s.footer.center, "{page}");
+        let b = Style::named("book");
+        assert!(b.page.0 < s.page.0 && b.indent > 0.0 && b.headings[0].break_before);
+        assert_eq!((b.header.center.as_str(), b.header.first), ("{section}", false));
+    }
+
+    #[test]
+    fn page_numbers_off_clears_the_footer_number() {
+        let s = Style::for_document(&[("page-numbers".into(), "false".into())]);
+        assert_eq!(s.footer.center, "");
+        let s = Style::for_document(&[("header-right".into(), "{title}".into())]);
+        assert_eq!(s.header.right, "{title}");
     }
 
     #[test]

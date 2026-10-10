@@ -64,7 +64,7 @@ fn outline(entries: &[OutlineEntry]) -> Outline {
     out
 }
 
-pub fn write(fs: &FontSystem, laid: &Laid, title: &str) -> Result<Vec<u8>, String> {
+pub fn write(fs: &FontSystem, laid: &Laid, title: &str, author: &str) -> Result<Vec<u8>, String> {
     let mut doc = Document::new();
     let mut fonts = HashMap::new();
     let size = Size::from_wh(laid.size.0, laid.size.1).ok_or("bad page size")?;
@@ -109,15 +109,23 @@ pub fn write(fs: &FontSystem, laid: &Laid, title: &str) -> Result<Vec<u8>, Strin
                             surface.pop();
                         }
                     }
-                    Item::Link { x, y, w, h, url } => links.push((*x, *y, *w, *h, url.clone())),
+                    Item::Link { x, y, w, h, url } => links.push((*x, *y, *w, *h, Ok(url.clone()))),
+                    Item::GoTo { x, y, w, h, page, top } => links.push((*x, *y, *w, *h, Err((*page, *top)))),
                 }
             }
             surface.finish();
         }
-        for (x, y, w, h, url) in links {
-            if let Some(r) = Rect::from_xywh(x, y, w, h) {
-                let target = Target::Action(Action::Link(LinkAction::new(url.clone())));
-                p.add_annotation(Annotation::new_link(LinkAnnotation::new(r, target), Some(url)));
+        for (x, y, w, h, to) in links {
+            let Some(r) = Rect::from_xywh(x, y, w, h) else { continue };
+            match to {
+                Ok(url) => {
+                    let target = Target::Action(Action::Link(LinkAction::new(url.clone())));
+                    p.add_annotation(Annotation::new_link(LinkAnnotation::new(r, target), Some(url)));
+                }
+                Err((page, top)) => {
+                    let target = Target::Destination(XyzDestination::new(page, Point::from_xy(0.0, top)).into());
+                    p.add_annotation(Annotation::new_link(LinkAnnotation::new(r, target), None));
+                }
             }
         }
         p.finish();
@@ -125,6 +133,10 @@ pub fn write(fs: &FontSystem, laid: &Laid, title: &str) -> Result<Vec<u8>, Strin
     if !laid.outline.is_empty() {
         doc.set_outline(outline(&laid.outline));
     }
-    doc.set_metadata(Metadata::new().title(title.to_string()));
+    let mut meta = Metadata::new().title(title.to_string());
+    if !author.is_empty() {
+        meta = meta.authors(vec![author.to_string()]);
+    }
+    doc.set_metadata(meta);
     doc.finish().map_err(|e| format!("PDF: {e:?}"))
 }

@@ -48,7 +48,8 @@ pub fn typeset_text(fs: &mut FontSystem, text: &str, path: &Path) -> Result<(Lai
         .or_else(|| laid.outline.first().map(|e| e.title.clone()))
         .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
         .unwrap_or_default();
-    let bytes = pdf::write(fs, &laid, &title)?;
+    let author = front.iter().find(|(k, _)| k == "author").map(|(_, v)| v.as_str()).unwrap_or("");
+    let bytes = pdf::write(fs, &laid, &title, author)?;
     Ok((laid, bytes))
 }
 

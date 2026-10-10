@@ -35,6 +35,26 @@ pub enum Action {
     Extract,
     RotatePages,
     DeletePages,
+    // Writing: what goes in at the caret.
+    Table,
+    Footnote,
+    Contents,
+    Picture,
+    PageBreak,
+    // The table the caret is in.
+    AddRow,
+    RemoveRow,
+    AddColumn,
+    RemoveColumn,
+    // The picked picture.
+    Smaller,
+    Larger,
+    AlignLeft,
+    AlignCenter,
+    AlignRight,
+    RemovePicture,
+    /// A new writing document, from a style.
+    New,
 }
 
 pub struct Button {

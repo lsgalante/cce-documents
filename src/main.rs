@@ -35,6 +35,15 @@
 //! another program changes it. The sidebar shows its outline. Ctrl+E
 //! exports the PDF, Ctrl+P prints (any document).
 //!
+//! The toolbar (and keys) put in what a manuscript needs: a table (Ctrl+Alt+T;
+//! Tab walks its cells, Enter goes down a row, the toolbar adds and removes
+//! rows and columns), a footnote (Ctrl+Alt+F: the caret goes to its text at
+//! the foot of the page, Esc comes back), the table of contents (generated,
+//! each entry leading to its heading), a picture (click one to pick it: [
+//! and ] resize, l c r align, Delete removes), and a page break
+//! (Ctrl+Enter). Ctrl+N starts a new document from a style;
+//! `cce-documents --new <style> <file.md>` does it from a shell.
+//!
 //! Keys: o open · +/- zoom · 0 fit · 1 actual size · r/l rotate ·
 //! arrows/PageUp/PageDown/Home/End pages · Ctrl+F find · Enter/F3 next match
 //! (Shift: previous) · Esc close an editor, find, the pick, the selection or
@@ -167,6 +176,8 @@ struct Find {
     focused: bool,
     /// Matches in document order: a page and the rects one match covers.
     hits: Vec<(usize, Vec<PtRect>)>,
+    /// In a writing document, each match's file bytes (to select it).
+    spans: Vec<(usize, usize)>,
     current: Option<usize>,
     done: bool,
 }
@@ -187,6 +198,10 @@ struct DocumentsApp {
     notify: calloop::channel::Sender<Message>,
     /// The Markdown document being edited, when one is open.
     writer: Option<editor::Editor>,
+    /// A picked picture in the writing document: its block.
+    picture: Option<usize>,
+    /// The new-document chooser, open: the styles to choose from.
+    chooser: Option<Vec<String>>,
     /// The font system writing documents are laid out and drawn with,
     /// made on the first one (slow: it reads every system font).
     fonts: Option<Arc<Mutex<cce_ui::cosmic_text::FontSystem>>>,
@@ -492,6 +507,7 @@ impl DocumentsApp {
         self.stroke = None;
         self.editor = None;
         self.writer = None;
+        self.picture = None;
         self.dirty = false;
         self.quit_armed = false;
         self.next_doc += 1;
@@ -544,6 +560,12 @@ impl DocumentsApp {
         }
         self.clamp_scroll();
         self.reveal_caret();
+        if self.picture.is_some_and(|b| self.writer.as_ref().is_none_or(|w| w.doc.blocks.get(b).is_none_or(|bl| bl.picture.is_none()))) {
+            self.picture = None;
+        }
+        if self.find.is_some() {
+            self.find_in_writer(false);
+        }
     }
 
     /// Scroll as little as needed to show the caret, clear of the toolbar.
@@ -581,6 +603,30 @@ impl DocumentsApp {
     fn writer_key(&mut self, event: &KeyEvent) -> Option<Option<Message>> {
         let (ctrl, shift) = (event.ctrl, event.shift);
         let is = |c: &str| matches!(&event.logical_key, Key::Character(k) if k.eq_ignore_ascii_case(c));
+        // A picked picture takes its keys; any other key lets it go.
+        if let Some(b) = self.picture {
+            let action = match &event.logical_key {
+                Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => Some(Action::RemovePicture),
+                Key::Character(c) if !ctrl && c == "[" => Some(Action::Smaller),
+                Key::Character(c) if !ctrl && c == "]" => Some(Action::Larger),
+                Key::Character(c) if !ctrl && c == "l" => Some(Action::AlignLeft),
+                Key::Character(c) if !ctrl && c == "c" => Some(Action::AlignCenter),
+                Key::Character(c) if !ctrl && c == "r" => Some(Action::AlignRight),
+                Key::Named(NamedKey::Escape) => {
+                    self.picture = None;
+                    return Some(None);
+                }
+                _ => None,
+            };
+            if let Some(a) = action {
+                let _ = b;
+                self.run_action(a);
+                return Some(None);
+            }
+            if !matches!(event.logical_key, Key::Named(NamedKey::Control | NamedKey::Shift | NamedKey::Alt | NamedKey::Super)) {
+                self.picture = None;
+            }
+        }
         let w = self.writer.as_mut()?;
         let mut changes = None;
         match &event.logical_key {
@@ -602,12 +648,18 @@ impl DocumentsApp {
             Key::Named(NamedKey::End) => w.row_edge(true, shift),
             Key::Named(NamedKey::Backspace) => changes = w.delete(false),
             Key::Named(NamedKey::Delete) => changes = w.delete(true),
-            Key::Named(NamedKey::Enter) => changes = Some(w.enter()),
-            Key::Named(NamedKey::Tab) => {}
+            Key::Named(NamedKey::Enter) if ctrl => changes = Some(w.insert_block("\\pagebreak", None)),
+            Key::Named(NamedKey::Enter) => changes = w.enter(),
+            Key::Named(NamedKey::Tab) => changes = w.cell_step(!shift),
             Key::Named(NamedKey::Escape) if w.selection().is_some() => {
                 let c = w.caret();
                 w.set_caret(c, false);
             }
+            Key::Named(NamedKey::Escape) if w.kind() == Some(writing::edit::Kind::Note) => {
+                w.leave_note();
+            }
+            Key::Character(_) if ctrl && event.alt && is("f") => changes = Some(w.footnote()),
+            Key::Character(_) if ctrl && event.alt && is("t") => changes = w.table(),
             Key::Character(_) if ctrl && event.alt => {
                 let level = ["0", "1", "2", "3"].iter().position(|d| is(d))?;
                 changes = w.heading(level as u8);
@@ -768,9 +820,9 @@ impl DocumentsApp {
         let Some(i) = self.outline_rects().iter().position(|r| x as f32 >= r.x && x as f32 <= r.x + r.width && y as f32 >= r.y && y as f32 <= r.y + r.height) else { return };
         let Some(w) = &mut self.writer else { return };
         let Some(entry) = w.doc.outline.get(i).cloned() else { return };
-        // The i-th heading block is the i-th outline entry.
-        if let Some(b) = w.doc.blocks.iter().filter(|b| matches!(b.kind, writing::edit::Kind::Heading(_))).nth(i) {
-            let src = b.source_of(0, false);
+        // The i-th heading is the i-th outline entry.
+        if let Some(u) = w.doc.units.iter().filter(|u| matches!(u.kind, writing::edit::Kind::Heading(_))).nth(i) {
+            let src = u.source_of(0, false);
             w.set_caret(src, false);
         }
         let (rects, _, _) = self.layout();
@@ -866,6 +918,7 @@ impl DocumentsApp {
             edit: LineEdit::default(),
             focused: true,
             hits: Vec::new(),
+            spans: Vec::new(),
             current: None,
             done: false,
         });
@@ -893,8 +946,42 @@ impl DocumentsApp {
             }
             None => String::new(),
         };
+        if self.writer.is_some() {
+            self.find_in_writer(true);
+            return;
+        }
         if let (Some(e), Some(doc)) = (self.backend.engine(), &self.doc) {
             e.search(doc.id, self.search_generation, query);
+        }
+    }
+
+    /// Search the writing document's text (all at once: it is all laid
+    /// out). `fresh`: a new query, whose first match at or after the view
+    /// becomes current; else the matches after an edit, keeping the place.
+    fn find_in_writer(&mut self, fresh: bool) {
+        let here = self.current_page();
+        let (Some(w), Some(f)) = (&self.writer, &mut self.find) else { return };
+        let spans = w.doc.find(&f.edit.text);
+        f.hits = spans
+            .iter()
+            .map(|&(a, z)| {
+                let rects: Vec<(usize, PtRect)> = w.doc.selection(a, z).into_iter().map(|(p, x, y, sw, sh)| (p, PtRect { x0: x as f64, y0: y as f64, x1: (x + sw) as f64, y1: (y + sh) as f64 })).collect();
+                (rects.first().map_or(0, |r| r.0), rects.into_iter().map(|(_, r)| r).collect())
+            })
+            .collect();
+        f.spans = spans;
+        f.done = true;
+        f.current = if f.hits.is_empty() {
+            None
+        } else if fresh {
+            Some(f.hits.iter().position(|(p, _)| *p >= here).unwrap_or(0))
+        } else {
+            f.current.map(|c| c.min(f.hits.len() - 1))
+        };
+        if fresh {
+            if let Some((p, r)) = f.current.and_then(|c| f.hits.get(c)).and_then(|(p, r)| r.first().map(|r| (*p, r.clone()))) {
+                self.reveal(p, &r);
+            }
         }
     }
 
@@ -912,6 +999,12 @@ impl DocumentsApp {
         };
         f.current = Some(i);
         let (page, rects) = f.hits[i].clone();
+        // In a writing document the match is selected, so typing replaces
+        // it and Esc leaves the caret there.
+        if let (Some(w), Some(&(a, z))) = (self.writer.as_mut(), f.spans.get(i)) {
+            w.set_caret(a, false);
+            w.set_caret(z, true);
+        }
         if let Some(r) = rects.first() {
             self.reveal(page, r);
         }
@@ -1357,6 +1450,124 @@ impl DocumentsApp {
             Action::Extract => self.extract_pages(),
             Action::RotatePages => self.rotate_pages(1),
             Action::DeletePages => self.delete_pages(),
+            Action::New => self.chooser = Some(writing::style::available()),
+            Action::Picture => self.insert_picture(),
+            _ => self.writing_action(action),
+        }
+    }
+
+    /// A toolbar action on the writing document.
+    fn writing_action(&mut self, action: Action) {
+        let picked = self.picture;
+        let share = picked.and_then(|b| {
+            let w = self.writer.as_ref()?;
+            let &(page, _) = w.doc.places.get(b)?.first()?;
+            let (_, (_, _, pw, _)) = w.doc.pictures_on(page).into_iter().find(|(pb, _)| *pb == b)?;
+            Some(pw / w.doc.frame.2)
+        });
+        let Some(w) = self.writer.as_mut() else { return };
+        use writing::md::{ColAlign, Width};
+        let resize = |up: bool| {
+            let s = share.unwrap_or(0.5);
+            let s = ((s * 20.0).round() + if up { 2.0 } else { -2.0 }) / 20.0;
+            Width::Share(s.clamp(0.1, 1.0))
+        };
+        let changes = match action {
+            Action::Table => w.table(),
+            Action::Footnote => Some(w.footnote()),
+            Action::Contents => Some(w.insert_block("[TOC]", None)),
+            Action::PageBreak => Some(w.insert_block("\\pagebreak", None)),
+            Action::AddRow => w.add_row(),
+            Action::RemoveRow => w.remove_row(),
+            Action::AddColumn => w.add_column(),
+            Action::RemoveColumn => w.remove_column(),
+            Action::Smaller | Action::Larger => picked.and_then(|b| w.set_picture(b, Some(resize(action == Action::Larger)), None)),
+            Action::AlignLeft => picked.and_then(|b| w.set_picture(b, None, Some(ColAlign::Left))),
+            Action::AlignCenter => picked.and_then(|b| w.set_picture(b, None, Some(ColAlign::Center))),
+            Action::AlignRight => picked.and_then(|b| w.set_picture(b, None, Some(ColAlign::Right))),
+            Action::RemovePicture => {
+                self.picture = None;
+                picked.and_then(|b| w.remove_picture(b))
+            }
+            _ => None,
+        };
+        if let Some(ch) = changes {
+            self.take_changes(ch);
+        }
+    }
+
+    /// Choose a picture file and put it in at the caret, by a path relative
+    /// to the document when it is beside or below it.
+    fn insert_picture(&mut self) {
+        let Some(w) = &self.writer else { return };
+        let dir = w.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let Some(file) = cce_ui::file_dialog::pick_file("Insert picture", &[("Pictures", &["png", "jpg", "jpeg"])]) else { return };
+        let rel = file.strip_prefix(&dir).map(Path::to_path_buf).unwrap_or(file);
+        let rel = rel.to_string_lossy().into_owned();
+        let dest = if rel.contains([' ', '(', ')']) { format!("<{rel}>") } else { rel };
+        let Some(w) = self.writer.as_mut() else { return };
+        let ch = w.insert_block(&format!("![]({dest})"), None);
+        self.take_changes(ch);
+    }
+
+    /// Make a new document in `style` at `path` (not over an existing
+    /// file) and open it.
+    fn create_document(&mut self, style: &str, path: &Path) {
+        let path = if writing::is_markdown(path) { path.to_path_buf() } else { path.with_extension("md") };
+        if path.exists() {
+            self.status = Some(format!("{} already exists; opened it instead", path.display()));
+            self.open(&path);
+            return;
+        }
+        if let Err(e) = std::fs::write(&path, writing::style::template(style)) {
+            self.error = Some(format!("{}: {e}", path.display()));
+            return;
+        }
+        self.open(&path);
+        // The caret in the first heading, ready to name the document.
+        if let Some(w) = self.writer.as_mut() {
+            let end = w.doc.units.iter().find(|u| u.live).map(|u| (u.source_of(0, false), u.source_of(u.text.len(), true)));
+            if let Some((a, z)) = end {
+                w.set_caret(a, false);
+                w.set_caret(z, true);
+            }
+        }
+    }
+
+    /// The chooser's rows: one per style, centred in the window.
+    fn chooser_rects(&self) -> (Rect, Vec<Rect>) {
+        let n = self.chooser.as_ref().map_or(0, |c| c.len());
+        let (w, row) = (280.0f32, 34.0f32);
+        let h = 52.0 + n as f32 * row + 12.0;
+        let panel = Rect { x: (self.win.0 - w) / 2.0, y: ((self.win.1 - h) / 2.0).max(8.0), width: w, height: h };
+        let rows = (0..n).map(|i| Rect { x: panel.x + 10.0, y: panel.y + 48.0 + i as f32 * row, width: w - 20.0, height: row - 4.0 }).collect();
+        (panel, rows)
+    }
+
+    fn paint_chooser(&mut self, pc: &mut PaintCtx) {
+        let Some(styles) = self.chooser.clone() else { return };
+        pc.quad(Rect { x: 0.0, y: 0.0, width: self.win.0, height: self.win.1 }, [0.0, 0.0, 0.0, 0.35]);
+        let (panel, rows) = self.chooser_rects();
+        pc.rounded_rect(panel, 10.0, (true, true, true, true), [0.12, 0.12, 0.13, 0.98]);
+        pc.text("New document in the style…".to_string(), panel.x + 16.0, panel.y + 16.0, 13.0, [220, 220, 220]);
+        let hover = rows.iter().position(|r| (self.pointer.0 as f32) >= r.x && (self.pointer.0 as f32) <= r.x + r.width && (self.pointer.1 as f32) >= r.y && (self.pointer.1 as f32) <= r.y + r.height);
+        for (i, (name, r)) in styles.into_iter().zip(rows).enumerate() {
+            pc.rounded_rect(r, 6.0, (true, true, true, true), [1.0, 1.0, 1.0, if hover == Some(i) { 0.16 } else { 0.06 }]);
+            let builtin = writing::style::BUILT_IN.iter().any(|(n, _)| *n == name);
+            let label = if builtin { format!("{name}   (built in)") } else { name };
+            pc.text(label, r.x + 12.0, cce_ui::layout::align_text_y(r.y, r.height, 13.0, 0.0), 13.0, [235, 235, 235]);
+        }
+    }
+
+    /// A press while the chooser is open: a style starts a document there
+    /// (asking where to save it); anywhere else closes it.
+    fn chooser_press(&mut self, x: f32, y: f32) {
+        let (_, rows) = self.chooser_rects();
+        let pick = rows.iter().position(|r| x >= r.x && x <= r.x + r.width && y >= r.y && y <= r.y + r.height);
+        let styles = self.chooser.take().unwrap_or_default();
+        let Some(style) = pick.and_then(|i| styles.get(i)) else { return };
+        if let Some(path) = cce_ui::file_dialog::save_file(&format!("New {style} document"), &[("Markdown", &["md"])]) {
+            self.create_document(style, &path);
         }
     }
 
@@ -1370,11 +1581,41 @@ impl DocumentsApp {
         let b = |label, action, on, enabled, group| Button { label, action, on, enabled, group };
         let writing = self.doc.as_ref().is_some_and(|d| d.writing);
         let buttons = if writing {
-            vec![
+            let kind = self.writer.as_ref().and_then(|w| w.kind());
+            let in_table = matches!(kind, Some(writing::edit::Kind::Cell { .. }));
+            let flows = kind.is_none_or(|k| k.flows());
+            let mut v = vec![
                 b("Outline", Action::Pages, self.sidebar, true, false),
-                b("Export PDF…", Action::Export, false, true, true),
+                b("Table", Action::Table, false, flows, true),
+                b("Footnote", Action::Footnote, false, kind.is_some_and(|k| k != writing::edit::Kind::Note), false),
+                b("Contents", Action::Contents, false, flows, false),
+                b("Picture…", Action::Picture, false, flows, false),
+                b("Page break", Action::PageBreak, false, flows, false),
+            ];
+            if in_table {
+                v.extend([
+                    b("+ Row", Action::AddRow, false, true, true),
+                    b("− Row", Action::RemoveRow, false, true, false),
+                    b("+ Column", Action::AddColumn, false, true, false),
+                    b("− Column", Action::RemoveColumn, false, true, false),
+                ]);
+            }
+            if self.picture.is_some() {
+                v.extend([
+                    b("Smaller", Action::Smaller, false, true, true),
+                    b("Larger", Action::Larger, false, true, false),
+                    b("Left", Action::AlignLeft, false, true, false),
+                    b("Centre", Action::AlignCenter, false, true, false),
+                    b("Right", Action::AlignRight, false, true, false),
+                    b("Remove", Action::RemovePicture, false, true, false),
+                ]);
+            }
+            v.extend([
+                b("New…", Action::New, false, true, true),
+                b("Export PDF…", Action::Export, false, true, false),
                 b("Print…", Action::Print, false, true, false),
-            ]
+            ]);
+            v
         } else {
             vec![
             b("Pages", Action::Pages, self.sidebar, true, false),
@@ -1504,9 +1745,25 @@ impl DocumentsApp {
                     pc.quad(self.screen_rect(rects, origin, page, &r), SELECTION);
                 }
             }
-            if let Some(c) = w.doc.caret(w.caret()) {
-                let r = self.screen_rect(rects, origin, c.page, &PtRect { x0: c.x as f64, y0: c.y as f64, x1: c.x as f64, y1: (c.y + c.h) as f64 });
-                pc.quad(Rect { x: r.x - 0.75, y: r.y, width: 1.5, height: r.height }, [0.1, 0.1, 0.1, 0.95]);
+            let picked = self.picture.and_then(|b| {
+                let &(page, _) = w.doc.places.get(b)?.first()?;
+                w.doc.pictures_on(page).into_iter().find(|(pb, _)| *pb == b).map(|(_, r)| (page, r))
+            });
+            match picked {
+                Some((page, (x, y, pw, ph))) => {
+                    let r = self.screen_rect(rects, origin, page, &PtRect { x0: x as f64, y0: y as f64, x1: (x + pw) as f64, y1: (y + ph) as f64 });
+                    let (x, y, w, h, t) = (r.x - 3.0, r.y - 3.0, r.width + 6.0, r.height + 6.0, 2.0);
+                    pc.quad(Rect { x, y, width: w, height: t }, PICKED);
+                    pc.quad(Rect { x, y: y + h - t, width: w, height: t }, PICKED);
+                    pc.quad(Rect { x, y, width: t, height: h }, PICKED);
+                    pc.quad(Rect { x: x + w - t, y, width: t, height: h }, PICKED);
+                }
+                None => {
+                    if let Some(c) = w.doc.caret(w.caret()) {
+                        let r = self.screen_rect(rects, origin, c.page, &PtRect { x0: c.x as f64, y0: c.y as f64, x1: c.x as f64, y1: (c.y + c.h) as f64 });
+                        pc.quad(Rect { x: r.x - 0.75, y: r.y, width: 1.5, height: r.height }, [0.1, 0.1, 0.1, 0.95]);
+                    }
+                }
             }
         }
         if let Some((page, index)) = self.picked {
@@ -1561,7 +1818,7 @@ impl DocumentsApp {
 
     fn paint_find(&mut self, pc: &mut PaintCtx) {
         let r = self.find_rect();
-        let has_engine = self.backend.engine().is_some();
+        let has_engine = self.backend.engine().is_some() || self.writer.is_some();
         let (Some(f), Some(fs)) = (&mut self.find, &mut self.font_system) else { return };
         let pad = cce_ui::layout::CONTROL_TEXT_INSET;
         pc.quad(r, [0.0, 0.0, 0.0, 0.6]);
@@ -1597,6 +1854,8 @@ impl Application for DocumentsApp {
         let mut app = Self {
             notify: sender.clone(),
             writer: None,
+            picture: None,
+            chooser: None,
             fonts: None,
             watching: Arc::new(AtomicU64::new(0)),
             backend: Backend::start(sender),
@@ -1641,8 +1900,14 @@ impl Application for DocumentsApp {
             shift: false,
             seen_renderer: false,
         };
-        if let Some(path) = std::env::args_os().nth(1) {
-            app.open(&PathBuf::from(path));
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        match args.first().and_then(|a| a.to_str()) {
+            Some("--new") => match (args.get(1).and_then(|s| s.to_str()), args.get(2)) {
+                (Some(style), Some(path)) => app.create_document(style, &PathBuf::from(path)),
+                _ => app.error = Some("Usage: cce-documents --new <style> <file.md>".to_string()),
+            },
+            Some(_) => app.open(&PathBuf::from(&args[0])),
+            None => {}
         }
         app
     }
@@ -1899,6 +2164,10 @@ impl Application for DocumentsApp {
                 self.status = None;
                 self.quit_armed = false;
                 *needs_rebuild = true;
+                if self.chooser.is_some() {
+                    self.chooser_press(pos.x, pos.y);
+                    return None;
+                }
                 let inside = |r: Rect| pos.x >= r.x && pos.x <= r.x + r.width && pos.y >= r.y && pos.y <= r.y + r.height;
                 if let Some((buttons, rects)) = self.toolbar() {
                     if rects.iter().any(|r| inside(*r)) {
@@ -1924,13 +2193,33 @@ impl Application for DocumentsApp {
                 }
                 // Writing: a press places the caret (Shift extends the
                 // selection), and a drag selects.
+                // A contents entry leads to its heading; a picture is picked.
                 if self.writer.is_some() {
                     if let Some((page, x, y)) = self.page_at(px, py, true) {
+                        let (x, y) = (x as f32, y as f32);
                         let shift = self.shift;
-                        if let Some(w) = self.writer.as_mut() {
-                            if let Some(src) = w.doc.hit(page, x as f32, y as f32) {
-                                w.set_caret(src, shift);
+                        let Some(w) = self.writer.as_mut() else { return None };
+                        if let Some((to, top)) = w.doc.goto_at(page, x, y) {
+                            if let Some(src) = w.doc.hit(to, w.doc.frame.0, top + 1.0) {
+                                w.set_caret(src, false);
                             }
+                            self.picture = None;
+                            let (rects, _, _) = self.layout();
+                            if let Some(r) = rects.get(to) {
+                                self.scroll.1 = (r.y + top as f64) * self.zoom - 40.0;
+                                self.fit = false;
+                                self.clamp_scroll();
+                            }
+                            return None;
+                        }
+                        let hit = w.doc.pictures_on(page).into_iter().find(|(_, (rx, ry, rw, rh))| x >= *rx && x <= rx + rw && y >= *ry && y <= ry + rh);
+                        if let Some((b, _)) = hit {
+                            self.picture = Some(b);
+                            return None;
+                        }
+                        self.picture = None;
+                        if let Some(src) = w.doc.hit(page, x, y) {
+                            w.set_caret(src, shift);
                         }
                         self.selecting = true;
                     }
@@ -2081,6 +2370,19 @@ impl Application for DocumentsApp {
         let is_q = !event.ctrl && matches!(&event.logical_key, Key::Character(c) if c == "q");
         if !modifier && !is_q {
             self.quit_armed = false;
+        }
+
+        if self.chooser.is_some() {
+            if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                self.chooser = None;
+            }
+            *needs_rebuild = true;
+            return None;
+        }
+        if chord("n") {
+            self.chooser = Some(writing::style::available());
+            *needs_rebuild = true;
+            return None;
         }
 
         // A Markdown document being edited takes the keys first (the find
@@ -2265,11 +2567,12 @@ impl Application for DocumentsApp {
         pc.root_plate(size.width, size.height);
 
         if self.doc.is_none() {
-            let msg = self.error.as_deref().unwrap_or("Press 'o' to open a file");
+            let msg = self.error.as_deref().unwrap_or("Press 'o' to open a file, Ctrl+N to start a new document");
             pc.text(msg, cce_ui::layout::root_plate_inset(), size.height / 2.0 - 8.0, 14.0, [180, 180, 180]);
             if self.find.is_some() {
                 self.paint_find(&mut pc);
             }
+            self.paint_chooser(&mut pc);
             return Some(pc.finish());
         }
 
@@ -2381,6 +2684,7 @@ impl Application for DocumentsApp {
         if self.find.is_some() {
             self.paint_find(&mut pc);
         }
+        self.paint_chooser(&mut pc);
 
         Some(pc.finish())
     }
