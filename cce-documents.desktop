@@ -1,11 +1,11 @@
 [Desktop Entry]
 Type=Application
 Name=Documents
-GenericName=Document Viewer
-Comment=View PDFs
+GenericName=Document Editor
+Comment=View and mark up PDFs; write documents in Markdown
 Exec=cce-documents %f
 Icon=cce-documents
 Terminal=false
-Categories=Office;Viewer;
-MimeType=application/pdf;
+Categories=Office;Viewer;WordProcessor;
+MimeType=application/pdf;text/markdown;text/x-markdown;
 NoDisplay=false

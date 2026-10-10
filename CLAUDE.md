@@ -213,7 +213,7 @@ indent=` (first-line indent for a plain paragraph after another), and
 come from `style::template` (`<name>.md` beside the style if there is
 one).
 
-Not yet: `.md` is not claimed in the desktop entry; front matter is not
+Not yet: front matter is not
 editable in the app (title/author come from it, `{title}` falls back to the
 first top-level heading); footnotes do not split across pages; a table's
 header row does not repeat on the next page; text does not wrap around
