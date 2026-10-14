@@ -436,7 +436,7 @@ impl Doc {
             Some(join(unit.source_of(t, true), self.units[n].source_of(0, false)))
         } else {
             if t > 0 {
-                let prev = stops.into_iter().filter(|&s| s < t).last().unwrap_or(0);
+                let prev = stops.into_iter().rfind(|&s| s < t).unwrap_or(0);
                 return Some(unit.source_of(prev, false)..unit.source_of(t, true));
             }
             if let Some(r) = self.between(u, false).filter(|_| unit.kind.joins()) {
@@ -581,7 +581,7 @@ impl Doc {
     /// (the last top-level heading on or before it).
     pub fn fields_for(&self, page: usize) -> Fields {
         let top = self.outline.iter().map(|e| e.level).min().unwrap_or(1);
-        let section = self.outline.iter().filter(|e| e.level == top && e.page <= page).last().map(|e| e.title.clone()).unwrap_or_default();
+        let section = self.outline.iter().rfind(|e| e.level == top && e.page <= page).map(|e| e.title.clone()).unwrap_or_default();
         Fields { section, page: page + 1, pages: self.page_count, ..self.fields.clone() }
     }
 
@@ -687,8 +687,11 @@ fn shape_key(block: &Block, style_key: u64, cx: &Context) -> u64 {
     h.finish()
 }
 
+/// A span's atoms: each one's text range and the source range it stands for.
+type Atoms = Vec<(Range<usize>, Range<usize>)>;
+
 /// Text and anchors (and atoms) of spans.
-fn spans_text(spans: &[md::Span], fallback: usize) -> (String, Vec<(usize, usize)>, Vec<(Range<usize>, Range<usize>)>) {
+fn spans_text(spans: &[md::Span], fallback: usize) -> (String, Vec<(usize, usize)>, Atoms) {
     let mut text = String::new();
     let mut anchors = Vec::new();
     let mut atoms = Vec::new();

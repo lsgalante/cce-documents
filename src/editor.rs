@@ -32,6 +32,9 @@ use crate::writing::md::{ColAlign, Width};
 use crate::writing::raster::Painter;
 use crate::Message;
 
+/// A block's source lines, each with its offset in the buffer.
+type SourceLines = Vec<(usize, String)>;
+
 /// How long after the last change the file is saved.
 pub const AUTOSAVE: Duration = Duration::from_millis(1500);
 
@@ -81,7 +84,7 @@ fn cells_of(line: &str) -> Vec<std::ops::Range<usize>> {
 /// The prefix of a Markdown line that makes it a list item (with any quote
 /// markers before it), with an ordered item's number one on.
 fn next_item_prefix(line: &str) -> Option<String> {
-    let quote_end = line.len() - line.trim_start_matches(|c: char| c == '>' || c == ' ').len();
+    let quote_end = line.len() - line.trim_start_matches(['>', ' ']).len();
     let (quotes, rest) = line.split_at(quote_end);
     let indent = rest.len() - rest.trim_start().len();
     let body = &rest[indent..];
@@ -335,8 +338,9 @@ impl Editor {
     }
 
     /// The table the caret is in: its block, the caret's row and column,
-    /// and the table's source split into lines (with their offsets).
-    fn table_at(&self) -> Option<(usize, usize, usize, usize, Vec<(usize, String)>)> {
+    /// the table's column count, and its source split into lines (with
+    /// their offsets).
+    fn table_at(&self) -> Option<(usize, usize, usize, usize, SourceLines)> {
         let u = self.doc.unit_at(self.caret())?;
         let Kind::Cell { row, col } = self.doc.units[u].kind else { return None };
         let b = self.doc.units[u].block;
@@ -352,7 +356,7 @@ impl Editor {
     }
 
     /// Put the caret at the end of a cell of block `b`.
-    fn to_cell(&mut self, b: usize, row: usize, col: usize) {
+    fn caret_to_cell(&mut self, b: usize, row: usize, col: usize) {
         if let Some(u) = self.doc.cell(b, row, col) {
             let unit = &self.doc.units[u];
             let to = unit.source_of(unit.text.len(), true);
@@ -379,10 +383,10 @@ impl Editor {
         };
         if r >= rows {
             let out = self.add_row();
-            self.to_cell(b, r, 0);
+            self.caret_to_cell(b, r, 0);
             return out;
         }
-        self.to_cell(b, r, c);
+        self.caret_to_cell(b, r, c);
         None
     }
 
@@ -396,7 +400,7 @@ impl Editor {
         let new = format!("\n|{}", "  |".repeat(cols.max(1)));
         let end = at + line.len();
         let out = self.replace(end, end, &new, EditKind::Other);
-        self.to_cell(b, row + 1, col);
+        self.caret_to_cell(b, row + 1, col);
         Some(out)
     }
 
@@ -408,7 +412,7 @@ impl Editor {
         }
         let (at, line) = &lines[row + 1];
         let out = self.replace(at - 1, at + line.len(), "", EditKind::Other);
-        self.to_cell(b, row.min(lines.len() - 3), col);
+        self.caret_to_cell(b, row.min(lines.len() - 3), col);
         Some(out)
     }
 
@@ -423,7 +427,7 @@ impl Editor {
             edits.push((at + pos..at + pos, new.to_string()));
         }
         let out = self.replace_many(edits);
-        self.to_cell(b, row, col + 1);
+        self.caret_to_cell(b, row, col + 1);
         Some(out)
     }
 
@@ -443,7 +447,7 @@ impl Editor {
             edits.push((at + r.start..at + r.end, String::new()));
         }
         let out = self.replace_many(edits);
-        self.to_cell(b, row, col.min(cols - 2));
+        self.caret_to_cell(b, row, col.min(cols - 2));
         Some(out)
     }
 

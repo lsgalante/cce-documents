@@ -35,7 +35,7 @@ pub fn page_sizes(path: &Path) -> Result<Vec<PageSize>, String> {
         let Some((_, field)) = rest.trim_start().split_once(' ') else { continue };
         if let Some(v) = field.trim_start().strip_prefix("size:") {
             // "595.276 x 841.89 pts (A4)"
-            let mut it = v.trim().split_whitespace();
+            let mut it = v.split_whitespace();
             let w: f64 = it.next().and_then(|s| s.parse().ok()).ok_or("pdfinfo: bad size")?;
             let h: f64 = it.nth(1).and_then(|s| s.parse().ok()).ok_or("pdfinfo: bad size")?;
             sizes.push(PageSize { w, h });

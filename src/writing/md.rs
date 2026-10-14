@@ -448,7 +448,7 @@ pub fn parse_located(body: &str, base: usize) -> Vec<(Block, Range<usize>)> {
                     if spans.is_empty() {
                         // An empty cell still takes the caret: between its
                         // pipes, in the middle of its spaces.
-                        let at = t.cell.start + (t.cell.len() + 1) / 2;
+                        let at = t.cell.start + t.cell.len().div_ceil(2);
                         spans.push(Span { src: vec![(0, at)], ..Default::default() });
                     }
                     let cell = Cell { spans, src: t.cell.clone() };

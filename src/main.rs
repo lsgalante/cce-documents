@@ -703,9 +703,9 @@ impl DocumentsApp {
             }
             // Other chords are the app's (open, print, export, zoom, quit).
             _ if ctrl => return None,
-            _ => match event.text.as_deref().filter(|t| !t.is_empty() && !t.chars().any(char::is_control)) {
-                Some(text) => changes = Some(w.type_text(text)),
-                None => return None,
+            _ => {
+                let text = event.text.as_deref().filter(|t| !t.is_empty() && !t.chars().any(char::is_control))?;
+                changes = Some(w.type_text(text))
             },
         }
         match changes {
@@ -993,7 +993,7 @@ impl DocumentsApp {
             f.current.map(|c| c.min(f.hits.len() - 1))
         };
         if fresh {
-            if let Some((p, r)) = f.current.and_then(|c| f.hits.get(c)).and_then(|(p, r)| r.first().map(|r| (*p, r.clone()))) {
+            if let Some((p, r)) = f.current.and_then(|c| f.hits.get(c)).and_then(|(p, r)| r.first().map(|r| (*p, *r))) {
                 self.reveal(p, &r);
             }
         }
@@ -1836,9 +1836,7 @@ impl DocumentsApp {
         let (Some(f), Some(fs)) = (&mut self.find, &mut self.font_system) else { return };
         let pad = cce_ui::layout::CONTROL_TEXT_INSET;
         pc.quad(r, [0.0, 0.0, 0.0, 0.6]);
-        let count = if !has_engine {
-            String::new()
-        } else if f.edit.text.is_empty() {
+        let count = if !has_engine || f.edit.text.is_empty() {
             String::new()
         } else if f.hits.is_empty() {
             if f.done { "no matches".to_string() } else { "searching…".to_string() }
@@ -2213,7 +2211,7 @@ impl Application for DocumentsApp {
                     if let Some((page, x, y)) = self.page_at(px, py, true) {
                         let (x, y) = (x as f32, y as f32);
                         let shift = self.shift;
-                        let Some(w) = self.writer.as_mut() else { return None };
+                        let w = self.writer.as_mut()?;
                         if let Some((to, top)) = w.doc.goto_at(page, x, y) {
                             if let Some(src) = w.doc.hit(to, w.doc.frame.0, top + 1.0) {
                                 w.set_caret(src, false);

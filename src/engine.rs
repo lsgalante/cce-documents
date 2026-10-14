@@ -754,7 +754,7 @@ fn render(lib: &Lib, o: &mut Pdf, job: &Job) -> Result<image::RgbaImage, String>
         let mut rgba = vec![0u8; wu * hu * 4];
         for y in 0..hu {
             let row = std::slice::from_raw_parts(buf.add(y * stride), wu * 4);
-            for (dst, src) in rgba[y * wu * 4..(y + 1) * wu * 4].chunks_exact_mut(4).zip(row.chunks_exact(4)) {
+            for (dst, src) in rgba[y * wu * 4..(y + 1) * wu * 4].as_chunks_mut::<4>().0.iter_mut().zip(row.as_chunks::<4>().0) {
                 dst.copy_from_slice(&[src[2], src[1], src[0], 255]);
             }
         }
@@ -1621,7 +1621,7 @@ trailer << /Root 1 0 R >>\n%%EOF\n";
         eprintln!("typeset: {} pages, {compared} glyphs placed within {worst:.3} pt of the layout", laid.pages.len());
         let titles: Vec<String> = outline(lib, &o).into_iter().map(|(t, _)| t).collect();
         assert_eq!(titles, vec!["On Typesetting".to_string()], "top level of the outline");
-        assert!(link_targets(lib, &mut o, 0).len() >= 1, "the link survives as an annotation");
+        assert!(!link_targets(lib, &mut o, 0).is_empty(), "the link survives as an annotation");
         o.close(lib);
     }
 }

@@ -486,6 +486,7 @@ fn row_width(row: &Row) -> f32 {
 /// A marker hung left of a row's text, on its baseline, `gap` before
 /// `x`: the first of the row's glyph runs, so the PDF's text reads
 /// marker, then text.
+#[allow(clippy::too_many_arguments)]
 fn hang(fs: &mut FontSystem, row: &mut Row, marker: &str, face: &Face, look: &Look, leading: f32, color: [u8; 3], x: f32, gap: f32) {
     let mut m = shape_rows(fs, &plain(marker), face, look, 200.0, leading, color, Set::Left);
     not_text(&mut m);
