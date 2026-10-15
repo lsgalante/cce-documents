@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 # doc_editor: the Markdown being edited lives in DocEditor's buffer (lines,
 # caret, selection, undo).
-cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "d147290448c960fc333438bdda5f5c9106ffbf95", features = ["doc_editor", "file_dialog"] }
+cce-ui = { git = "https://github.com/lsgalante/cce-ui.git", rev = "fb27421186cb7105800a28bb77cff80c589ee89b", features = ["doc_editor", "file_dialog"] }
 calloop = "0.13.0"
 wayland-client = { version = "0.31", features = ["system"] }
 # Decodes the PNG pages pdftoppm writes, and the PNG and JPEG pictures a
