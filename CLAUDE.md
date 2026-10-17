@@ -33,6 +33,7 @@ Split from cce-preview on 2026-10-09; pictures went to cce-image.
 | `text.rs` | Pure selection geometry: a page's chars with boxes, caret hit-testing, highlight rects, copied text |
 | `poppler.rs` | The fallback: `pdfinfo` sizes, `pdftoppm` renders, view-only |
 | `print.rs` | The Print portal (ashpd on its own thread): `PreparePrint`, then `Print` with the PDF's fd |
+| `ui_state.rs` | Where the window was, for the next launch: the document, page, zoom (or fit) and a Markdown caret, in `cce_state_dir()/documents/state.json` |
 | `editor.rs` | Editing a Markdown document: the text in cce-ui's `DocEditor` `Buffer`, every operation in file bytes and visible characters (tables, footnotes, pictures and inserted blocks included), autosave |
 | `writing/md.rs` | Markdown → flat blocks (pulldown-cmark): tables, footnotes and their numbers, `[TOC]`, picture attributes, front matter, `\pagebreak` |
 | `writing/style.rs` | Page, margins, faces, spacing; the built-in `manuscript` style, user KDL styles, front-matter overrides |
@@ -41,6 +42,15 @@ Split from cce-preview on 2026-10-09; pictures went to cce-image.
 | `writing/raster.rs` | A page of the layout drawn into pixels (swash), and `Painter`, the thread that draws edited pages |
 | `writing/pdf.rs` | The pages written with krilla, glyph for glyph; outline from headings, links |
 | `writing/mod.rs` | `typeset_text` (the PDF from text, through the same `Layouter`) and the print cache path |
+
+**A launch goes back where the window was** (`ui_state.rs`): the document is
+recorded when one opens, the page, zoom and caret in `on_exit`. A restart
+(`ccectl restart-app`) replays the same argv, so the record keeps what argv
+asked for (the file, and `--new`'s style): the same argv again, or none,
+reopens the recorded document — opened, never created, so `--new` replayed
+does not make its file again — while argv asking for anything else wins. A
+recorded document that has gone is not reopened; the page is clamped to the
+document.
 
 ## PDFium
 

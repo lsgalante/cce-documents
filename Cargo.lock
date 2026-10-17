@@ -521,6 +521,8 @@ dependencies = [
  "pdfium-render",
  "pollster",
  "pulldown-cmark",
+ "serde",
+ "serde_json",
  "wayland-client",
 ]
 

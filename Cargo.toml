@@ -13,6 +13,9 @@ wayland-client = { version = "0.31", features = ["system"] }
 # Markdown document shows while it is edited.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 log = "0.4"
+# The window's place for the next launch (src/ui_state.rs).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 env_logger = "0.11"
 # PDFium, loaded at runtime from ~/.local/lib (scripts/fetch-pdfium), and
 # driven through its C API (see src/engine.rs); pdfium-render supplies the

@@ -60,6 +60,7 @@ mod poppler;
 mod print;
 mod text;
 mod trim;
+mod ui_state;
 mod writing;
 
 use std::collections::{HashMap, HashSet};
@@ -487,6 +488,34 @@ impl DocumentsApp {
         }
     }
 
+    /// Where the window is, for the next launch (`ui_state`).
+    fn save_place(&self) {
+        let view = ui_state::View {
+            page: self.current_page(),
+            zoom: (!self.fit).then_some(self.zoom),
+            caret: self.writer.as_ref().map(|w| w.caret()),
+        };
+        ui_state::save(self.doc.as_ref().map(|d| d.path.as_path()), view);
+    }
+
+    /// Go back to a saved view of the open document, as far as it still fits:
+    /// the page clamped to the document, the zoom to its range.
+    fn restore_view(&mut self, view: ui_state::View) {
+        let Some(last) = self.doc.as_ref().and_then(|d| d.pages.len().checked_sub(1)) else { return };
+        if let (Some(w), Some(caret)) = (self.writer.as_mut(), view.caret) {
+            w.set_caret(caret, false);
+        }
+        let page = view.page.min(last);
+        match view.zoom {
+            None => self.fit_page(page),
+            Some(z) => {
+                self.zoom = z.clamp(ZOOM_MIN, ZOOM_MAX);
+                self.fit = false;
+                self.go_to_page(page);
+            }
+        }
+    }
+
     /// Scroll so a rect on a page is in view, a third of the way down.
     fn reveal(&mut self, page: usize, r: &PtRect) {
         let (rects, cw, ch) = self.layout();
@@ -532,6 +561,7 @@ impl DocumentsApp {
                 }
                 self.doc = Some(d);
                 self.fit_page(0);
+                self.save_place();
             }
             Err(e) => {
                 self.doc = None;
@@ -1442,6 +1472,7 @@ impl DocumentsApp {
                 if let Some(d) = &mut self.doc {
                     d.path = target;
                 }
+                self.save_place();
             }
             Err(err) => self.status = Some(format!("Not saved: {err}")),
         }
@@ -1914,13 +1945,34 @@ impl Application for DocumentsApp {
             seen_renderer: false,
         };
         let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-        match args.first().and_then(|a| a.to_str()) {
-            Some("--new") => match (args.get(1).and_then(|s| s.to_str()), args.get(2)) {
-                (Some(style), Some(path)) => app.create_document(style, &PathBuf::from(path)),
-                _ => app.error = Some("Usage: cce-documents --new <style> <file.md>".to_string()),
-            },
-            Some(_) => app.open(&PathBuf::from(&args[0])),
-            None => {}
+        let new = args.first().is_some_and(|a| a == "--new");
+        let launched = ui_state::Launched {
+            file: args.get(if new { 2 } else { 0 }).map(|a| ui_state::absolute(Path::new(a))),
+            style: args.get(1).filter(|_| new).map(|s| s.to_string_lossy().into_owned()),
+        };
+        // The same command line reopening goes back where the window was
+        // instead (`ui_state`): it opens that document, and never makes one.
+        let view = match ui_state::initial(launched) {
+            ui_state::Start::Reopen(path, view) => {
+                app.open(&path);
+                Some(view)
+            }
+            ui_state::Start::Launch(view) => {
+                match args.first().and_then(|a| a.to_str()) {
+                    Some("--new") => match (args.get(1).and_then(|s| s.to_str()), args.get(2)) {
+                        (Some(style), Some(path)) => app.create_document(style, &PathBuf::from(path)),
+                        _ => app.error = Some("Usage: cce-documents --new <style> <file.md>".to_string()),
+                    },
+                    Some(_) => app.open(&PathBuf::from(&args[0])),
+                    None => {}
+                }
+                view
+            }
+        };
+        if let Some(view) = view {
+            // `open` recorded the first page; record where it went back to.
+            app.restore_view(view);
+            app.save_place();
         }
         app
     }
@@ -2039,6 +2091,10 @@ impl Application for DocumentsApp {
     fn idle_poll_interval(&self) -> Option<std::time::Duration> {
         // A pending autosave is a real-time deadline the loop cannot see.
         self.writer.as_ref().and_then(|w| w.save_due).map(|_| std::time::Duration::from_millis(250))
+    }
+
+    fn on_exit(&mut self) {
+        self.save_place();
     }
 
     fn tick(&mut self, dt: f32, needs_rebuild: &mut bool) {
